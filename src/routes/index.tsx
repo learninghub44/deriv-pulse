@@ -13,6 +13,7 @@ import { AuthModal } from "@/components/auth/AuthModal";
 import { TradeJournalPanel } from "@/components/journal/TradeJournalPanel";
 import { AlertsPanel } from "@/components/alerts/AlertsPanel";
 import { AISignalPanel } from "@/components/ai/AISignalPanel";
+import { MarketAnalyzerPanel } from "@/components/ai/MarketAnalyzerPanel";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -126,6 +127,7 @@ function Index() {
   const [showJournal, setShowJournal] = useState(false);
   const [showAlerts, setShowAlerts] = useState(true);
   const [showAI, setShowAI] = useState(false);
+  const [showAnalyzer, setShowAnalyzer] = useState(false);
   const [alertConfig, setAlertConfig] = useState<Partial<import("@/hooks/use-alerts").AlertConfig>>({});
 
   const { user, profile, loading: authLoading, signOut } = useAuth();
@@ -174,6 +176,8 @@ function Index() {
           alertCount={alerts.length}
           onToggleAI={() => setShowAI((v) => !v)}
           showAI={showAI}
+          onToggleAnalyzer={() => setShowAnalyzer((v) => !v)}
+          showAnalyzer={showAnalyzer}
         />
       <div className="flex-1 grid grid-cols-1 xl:grid-cols-[260px_1fr] min-h-0">
         <SymbolSidebar
@@ -234,6 +238,14 @@ function Index() {
               </div>
             )}
 
+            {showAnalyzer && (
+              <div className="xl:col-span-6 md:col-span-2">
+                <Panel title="Market Analyzer" subtitle="Senior Trader · 10yr Experience · Groq AI">
+                  <MarketAnalyzerPanel ticks={ticks} symbol={symbol} windowSize={windowSize} />
+                </Panel>
+              </div>
+            )}
+
             {showJournal && user && (
               <div className="xl:col-span-6 md:col-span-2">
                 <TradeJournalPanel userId={user.id} currentSymbol={symbol} />
@@ -256,6 +268,7 @@ function TopBar({
   status, meta, ticks, onToggleSidebar,
   user, profile, authLoading, onSignIn, onSignOut, onToggleJournal, showJournal,
   onToggleAlerts, showAlerts, alertCount, onToggleAI, showAI,
+  onToggleAnalyzer, showAnalyzer,
 }: {
   status: string; meta: SymbolMeta; ticks: Tick[]; onToggleSidebar: () => void;
   user: import("@supabase/supabase-js").User | null;
@@ -264,6 +277,7 @@ function TopBar({
   onToggleJournal: () => void; showJournal: boolean;
   onToggleAlerts: () => void; showAlerts: boolean; alertCount: number;
   onToggleAI: () => void; showAI: boolean;
+  onToggleAnalyzer: () => void; showAnalyzer: boolean;
 }) {
   const last = ticks[ticks.length - 1];
   const prev = ticks[ticks.length - 2];
@@ -362,6 +376,16 @@ function TopBar({
                   }`}
                 >
                   ◈ AI Signal
+                </button>
+                <button
+                  onClick={onToggleAnalyzer}
+                  className={`px-2.5 py-1 rounded border text-[9px] uppercase tracking-[0.15em] font-mono transition-all ${
+                    showAnalyzer
+                      ? "border-accent/60 text-accent bg-accent/10 shadow-[0_0_8px_rgba(120,180,255,0.1)]"
+                      : "border-border text-muted-foreground hover:text-foreground hover:border-border/80"
+                  }`}
+                >
+                  ⊞ Analyzer
                 </button>
                 <button
                   onClick={onToggleJournal}
