@@ -14,6 +14,7 @@ import { TradeJournalPanel } from "@/components/journal/TradeJournalPanel";
 import { AlertsPanel } from "@/components/alerts/AlertsPanel";
 import { AISignalPanel } from "@/components/ai/AISignalPanel";
 import { MarketAnalyzerPanel } from "@/components/ai/MarketAnalyzerPanel";
+import { EntryPointScanner } from "@/components/signals/EntryPointScanner";
 import { DigitWheel, VolatilityGauge, TickPulseRing } from "@/components/charts/CircularPanels";
 
 export const Route = createFileRoute("/")({
@@ -129,6 +130,7 @@ function Index() {
   const [showAlerts, setShowAlerts] = useState(true);
   const [showAI, setShowAI] = useState(false);
   const [showAnalyzer, setShowAnalyzer] = useState(false);
+  const [showScanner, setShowScanner] = useState(true);
   const [alertConfig, setAlertConfig] = useState<Partial<import("@/hooks/use-alerts").AlertConfig>>({});
 
   const { user, profile, loading: authLoading, signOut } = useAuth();
@@ -179,6 +181,8 @@ function Index() {
           showAI={showAI}
           onToggleAnalyzer={() => setShowAnalyzer((v) => !v)}
           showAnalyzer={showAnalyzer}
+          onToggleScanner={() => setShowScanner((v) => !v)}
+          showScanner={showScanner}
         />
       <div className="flex-1 grid grid-cols-1 xl:grid-cols-[260px_1fr] min-h-0">
         <SymbolSidebar
@@ -252,6 +256,14 @@ function Index() {
               </div>
             )}
 
+            {showScanner && (
+              <div className="xl:col-span-6 md:col-span-2">
+                <Panel title="⚡ Entry Point Scanner" subtitle="RSI · EMA · BB · MTF · Pattern Recognition">
+                  <EntryPointScanner ticks={ticks} symbol={symbol} windowSize={windowSize} />
+                </Panel>
+              </div>
+            )}
+
             {showJournal && user && (
               <div className="xl:col-span-6 md:col-span-2">
                 <TradeJournalPanel userId={user.id} currentSymbol={symbol} />
@@ -275,6 +287,7 @@ function TopBar({
   user, profile, authLoading, onSignIn, onSignOut, onToggleJournal, showJournal,
   onToggleAlerts, showAlerts, alertCount, onToggleAI, showAI,
   onToggleAnalyzer, showAnalyzer,
+  onToggleScanner, showScanner,
 }: {
   status: string; meta: SymbolMeta; ticks: Tick[]; onToggleSidebar: () => void;
   user: import("@supabase/supabase-js").User | null;
@@ -284,6 +297,7 @@ function TopBar({
   onToggleAlerts: () => void; showAlerts: boolean; alertCount: number;
   onToggleAI: () => void; showAI: boolean;
   onToggleAnalyzer: () => void; showAnalyzer: boolean;
+  onToggleScanner: () => void; showScanner: boolean;
 }) {
   const last = ticks[ticks.length - 1];
   const prev = ticks[ticks.length - 2];
@@ -392,6 +406,16 @@ function TopBar({
                   }`}
                 >
                   ⊞ Analyzer
+                </button>
+                <button
+                  onClick={onToggleScanner}
+                  className={`px-2.5 py-1 rounded border text-[9px] uppercase tracking-[0.15em] font-mono transition-all ${
+                    showScanner
+                      ? "border-cyan-500/60 text-cyan-300 bg-cyan-500/10 shadow-[0_0_8px_rgba(34,211,238,0.15)]"
+                      : "border-border text-muted-foreground hover:text-foreground hover:border-border/80"
+                  }`}
+                >
+                  ⚡ Scanner
                 </button>
                 <button
                   onClick={onToggleJournal}
