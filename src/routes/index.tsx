@@ -6,6 +6,10 @@ import {
   fetchActiveSymbols,
   type Tick,
 } from "@/hooks/use-deriv-ticks";
+import { useAuth } from "@/hooks/use-auth";
+import { useWatchlists } from "@/hooks/use-watchlists";
+import { AuthModal } from "@/components/auth/AuthModal";
+import { TradeJournalPanel } from "@/components/journal/TradeJournalPanel";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -115,6 +119,11 @@ function Index() {
   const [windowSize, setWindowSize] = useState(100);
   const [symbols, setSymbols] = useState<SymbolMeta[]>(FALLBACK_SYMBOLS);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showAuth, setShowAuth] = useState(false);
+  const [showJournal, setShowJournal] = useState(false);
+
+  const { user, profile, loading: authLoading, signOut } = useAuth();
+  const { watchlists, defaultList, addSymbol, removeSymbol } = useWatchlists(user?.id);
 
   const { ticks, status } = useDerivTicks(symbol);
 
@@ -141,7 +150,19 @@ function Index() {
 
   return (
     <div className="min-h-screen bg-background text-foreground font-mono flex flex-col">
-      <TopBar status={status} meta={meta} ticks={ticks} onToggleSidebar={() => setSidebarOpen((v) => !v)} />
+      <TopBar
+          status={status}
+          meta={meta}
+          ticks={ticks}
+          onToggleSidebar={() => setSidebarOpen((v) => !v)}
+          user={user}
+          profile={profile}
+          authLoading={authLoading}
+          onSignIn={() => setShowAuth(true)}
+          onSignOut={signOut}
+          onToggleJournal={() => setShowJournal((v) => !v)}
+          showJournal={showJournal}
+        />
       <div className="flex-1 grid grid-cols-1 xl:grid-cols-[260px_1fr] min-h-0">
         <SymbolSidebar
           symbols={symbols}
@@ -177,9 +198,16 @@ function Index() {
             <div className="xl:col-span-2 md:col-span-2"><RecentTicksTable ticks={ticks} /></div>
 
             <div className="xl:col-span-6 md:col-span-2"><Disclaimer /></div>
+
+            {showJournal && user && (
+              <div className="xl:col-span-6 md:col-span-2">
+                <TradeJournalPanel userId={user.id} currentSymbol={symbol} />
+              </div>
+            )}
           </main>
         </div>
       </div>
+      {showAuth && <AuthModal onClose={() => setShowAuth(false)} />}
       <StatusBar status={status} ticks={ticks} meta={meta} symbolCount={symbols.length} />
     </div>
   );
@@ -190,15 +218,14 @@ function Index() {
  * ========================================================== */
 
 function TopBar({
-  status,
-  meta,
-  ticks,
-  onToggleSidebar,
+  status, meta, ticks, onToggleSidebar,
+  user, profile, authLoading, onSignIn, onSignOut, onToggleJournal, showJournal,
 }: {
-  status: string;
-  meta: SymbolMeta;
-  ticks: Tick[];
-  onToggleSidebar: () => void;
+  status: string; meta: SymbolMeta; ticks: Tick[]; onToggleSidebar: () => void;
+  user: import("@supabase/supabase-js").User | null;
+  profile: import("@/lib/database.types").Database["public"]["Tables"]["profiles"]["Row"] | null;
+  authLoading: boolean; onSignIn: () => void; onSignOut: () => void;
+  onToggleJournal: () => void; showJournal: boolean;
 }) {
   const last = ticks[ticks.length - 1];
   const prev = ticks[ticks.length - 2];
@@ -233,36 +260,45 @@ function TopBar({
         <span className="text-xs font-semibold truncate">{meta.display_name}</span>
         <span className="text-[10px] text-muted-foreground ml-2 truncate">{meta.symbol}</span>
       </div>
-      <div className="ml-auto flex items-center gap-4">
-        <div className="text-right">
+      <div className="ml-auto flex items-center gap-3">
+        <div className="text-right hidden lg:block">
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Last</div>
-          <div
-            className={`text-xl font-bold tabular-nums leading-none ${
-              dir === "up" ? "text-bull" : dir === "down" ? "text-bear" : "text-foreground"
-            }`}
-          >
+          <div className={`text-xl font-bold tabular-nums leading-none ${dir === "up" ? "text-bull" : dir === "down" ? "text-bear" : "text-foreground"}`}>
             {last ? last.quote.toFixed(last.pip_size) : "—"}
           </div>
         </div>
         <div className="text-right hidden sm:block">
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Session Δ</div>
-          <div
-            className={`text-sm tabular-nums leading-none ${
-              sessionChange > 0 ? "text-bull" : sessionChange < 0 ? "text-bear" : ""
-            }`}
-          >
-            {sessionChange >= 0 ? "+" : ""}
-            {sessionChange.toFixed(last?.pip_size ?? 2)}
-            <span className="text-[10px] text-muted-foreground ml-1">
-              ({sessionPct >= 0 ? "+" : ""}
-              {sessionPct.toFixed(3)}%)
-            </span>
+          <div className={`text-sm tabular-nums leading-none ${sessionChange > 0 ? "text-bull" : sessionChange < 0 ? "text-bear" : ""}`}>
+            {sessionChange >= 0 ? "+" : ""}{sessionChange.toFixed(last?.pip_size ?? 2)}
+            <span className="text-[10px] text-muted-foreground ml-1">({sessionPct >= 0 ? "+" : ""}{sessionPct.toFixed(3)}%)</span>
           </div>
         </div>
         <div className="flex items-center gap-2 text-[11px]">
           <span className={`size-2 rounded-full ${dot}`} />
-          <span className="uppercase tracking-widest text-muted-foreground">{status}</span>
+          <span className="uppercase tracking-widest text-muted-foreground hidden sm:inline">{status}</span>
         </div>
+        {!authLoading && (
+          <div className="flex items-center gap-2 border-l border-border pl-3">
+            {user ? (
+              <>
+                <button onClick={onToggleJournal} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors ${showJournal ? "border-primary text-primary bg-primary/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
+                  Journal
+                </button>
+                <span className="text-[10px] text-muted-foreground hidden md:block truncate max-w-[100px]">
+                  {profile?.display_name ?? user.email?.split("@")[0]}
+                </span>
+                <button onClick={onSignOut} className="px-2 py-1 rounded border border-border text-[10px] uppercase tracking-widest text-muted-foreground hover:text-bear hover:border-bear transition-colors">
+                  Sign Out
+                </button>
+              </>
+            ) : (
+              <button onClick={onSignIn} className="px-2 py-1 rounded border border-primary text-[10px] uppercase tracking-widest text-primary bg-primary/10 hover:bg-primary/20 transition-colors">
+                Sign In
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </header>
   );
