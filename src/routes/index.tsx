@@ -130,9 +130,9 @@ function Index() {
 
   const { user, profile, loading: authLoading, signOut } = useAuth();
   const { watchlists, defaultList, addSymbol, removeSymbol } = useWatchlists(user?.id);
-  const { alerts, dismiss, clearAll, testAlarm } = useAlerts(ticks, symbol, windowSize, alertConfig);
-
   const { ticks, status } = useDerivTicks(symbol);
+
+  const { alerts, dismiss, clearAll, testAlarm } = useAlerts(ticks, symbol, windowSize, alertConfig);
 
   useEffect(() => {
     let cancelled = false;
