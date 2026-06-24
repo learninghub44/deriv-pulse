@@ -91,3 +91,42 @@ export function lastDigit(quote: number, pipSize: number): number {
   const s = quote.toFixed(pipSize);
   return Number(s[s.length - 1]);
 }
+
+/** Singleton WS for fetching active symbols (one-off). */
+export async function fetchActiveSymbols(): Promise<
+  Array<{ symbol: string; display_name: string; market: string; submarket: string; pip: number }>
+> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(URL);
+    const timeout = setTimeout(() => {
+      ws.close();
+      reject(new Error("timeout"));
+    }, 8000);
+    ws.onopen = () =>
+      ws.send(JSON.stringify({ active_symbols: "brief", product_type: "basic" }));
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.active_symbols) {
+          clearTimeout(timeout);
+          resolve(
+            msg.active_symbols.map((s: Record<string, unknown>) => ({
+              symbol: String(s.symbol),
+              display_name: String(s.display_name),
+              market: String(s.market),
+              submarket: String(s.submarket),
+              pip: Number(s.pip) || 0.01,
+            })),
+          );
+          ws.close();
+        }
+      } catch (e) {
+        reject(e);
+      }
+    };
+    ws.onerror = () => {
+      clearTimeout(timeout);
+      reject(new Error("ws error"));
+    };
+  });
+}
