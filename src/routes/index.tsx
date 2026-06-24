@@ -8,8 +8,11 @@ import {
 } from "@/hooks/use-deriv-ticks";
 import { useAuth } from "@/hooks/use-auth";
 import { useWatchlists } from "@/hooks/use-watchlists";
+import { useAlerts } from "@/hooks/use-alerts";
 import { AuthModal } from "@/components/auth/AuthModal";
 import { TradeJournalPanel } from "@/components/journal/TradeJournalPanel";
+import { AlertsPanel } from "@/components/alerts/AlertsPanel";
+import { AISignalPanel } from "@/components/ai/AISignalPanel";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -121,9 +124,12 @@ function Index() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showAuth, setShowAuth] = useState(false);
   const [showJournal, setShowJournal] = useState(false);
+  const [showAlerts, setShowAlerts] = useState(true);
+  const [showAI, setShowAI] = useState(false);
 
   const { user, profile, loading: authLoading, signOut } = useAuth();
   const { watchlists, defaultList, addSymbol, removeSymbol } = useWatchlists(user?.id);
+  const { alerts, dismiss, clearAll } = useAlerts(ticks, symbol, windowSize);
 
   const { ticks, status } = useDerivTicks(symbol);
 
@@ -162,6 +168,11 @@ function Index() {
           onSignOut={signOut}
           onToggleJournal={() => setShowJournal((v) => !v)}
           showJournal={showJournal}
+          onToggleAlerts={() => setShowAlerts((v) => !v)}
+          showAlerts={showAlerts}
+          alertCount={alerts.length}
+          onToggleAI={() => setShowAI((v) => !v)}
+          showAI={showAI}
         />
       <div className="flex-1 grid grid-cols-1 xl:grid-cols-[260px_1fr] min-h-0">
         <SymbolSidebar
@@ -199,6 +210,22 @@ function Index() {
 
             <div className="xl:col-span-6 md:col-span-2"><Disclaimer /></div>
 
+            {showAlerts && (
+              <div className="xl:col-span-3 md:col-span-2">
+                <Panel title="Pattern Alerts" subtitle={alerts.length > 0 ? `${alerts.length} active` : "monitoring"}>
+                  <AlertsPanel alerts={alerts} onDismiss={dismiss} onClearAll={clearAll} />
+                </Panel>
+              </div>
+            )}
+
+            {showAI && (
+              <div className={showAlerts ? "xl:col-span-3 md:col-span-2" : "xl:col-span-6 md:col-span-2"}>
+                <Panel title="AI Signal Assistant" subtitle="Groq · llama-3.3-70b">
+                  <AISignalPanel ticks={ticks} symbol={symbol} windowSize={windowSize} />
+                </Panel>
+              </div>
+            )}
+
             {showJournal && user && (
               <div className="xl:col-span-6 md:col-span-2">
                 <TradeJournalPanel userId={user.id} currentSymbol={symbol} />
@@ -220,12 +247,15 @@ function Index() {
 function TopBar({
   status, meta, ticks, onToggleSidebar,
   user, profile, authLoading, onSignIn, onSignOut, onToggleJournal, showJournal,
+  onToggleAlerts, showAlerts, alertCount, onToggleAI, showAI,
 }: {
   status: string; meta: SymbolMeta; ticks: Tick[]; onToggleSidebar: () => void;
   user: import("@supabase/supabase-js").User | null;
   profile: import("@/lib/database.types").Database["public"]["Tables"]["profiles"]["Row"] | null;
   authLoading: boolean; onSignIn: () => void; onSignOut: () => void;
   onToggleJournal: () => void; showJournal: boolean;
+  onToggleAlerts: () => void; showAlerts: boolean; alertCount: number;
+  onToggleAI: () => void; showAI: boolean;
 }) {
   const last = ticks[ticks.length - 1];
   const prev = ticks[ticks.length - 2];
@@ -282,6 +312,12 @@ function TopBar({
           <div className="flex items-center gap-2 border-l border-border pl-3">
             {user ? (
               <>
+                <button onClick={onToggleAlerts} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors relative ${showAlerts ? "border-yellow-500/60 text-yellow-400 bg-yellow-500/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
+                  Alerts{alertCount > 0 && <span className="ml-1 text-[8px] bg-yellow-500 text-black rounded-full px-1">{alertCount}</span>}
+                </button>
+                <button onClick={onToggleAI} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors ${showAI ? "border-primary text-primary bg-primary/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
+                  AI Signal
+                </button>
                 <button onClick={onToggleJournal} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors ${showJournal ? "border-primary text-primary bg-primary/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
                   Journal
                 </button>
@@ -293,9 +329,14 @@ function TopBar({
                 </button>
               </>
             ) : (
-              <button onClick={onSignIn} className="px-2 py-1 rounded border border-primary text-[10px] uppercase tracking-widest text-primary bg-primary/10 hover:bg-primary/20 transition-colors">
-                Sign In
-              </button>
+              <>
+                <button onClick={onToggleAlerts} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors relative ${showAlerts ? "border-yellow-500/60 text-yellow-400 bg-yellow-500/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
+                  Alerts{alertCount > 0 && <span className="ml-1 text-[8px] bg-yellow-500 text-black rounded-full px-1">{alertCount}</span>}
+                </button>
+                <button onClick={onSignIn} className="px-2 py-1 rounded border border-primary text-[10px] uppercase tracking-widest text-primary bg-primary/10 hover:bg-primary/20 transition-colors">
+                  Sign In
+                </button>
+              </>
             )}
           </div>
         )}
