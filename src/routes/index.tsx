@@ -14,6 +14,7 @@ import { TradeJournalPanel } from "@/components/journal/TradeJournalPanel";
 import { AlertsPanel } from "@/components/alerts/AlertsPanel";
 import { AISignalPanel } from "@/components/ai/AISignalPanel";
 import { MarketAnalyzerPanel } from "@/components/ai/MarketAnalyzerPanel";
+import { DigitWheel, VolatilityGauge, TickPulseRing } from "@/components/charts/CircularPanels";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -209,6 +210,11 @@ function Index() {
             <div className="xl:col-span-2"><OverUnderPanel ticks={ticks} windowSize={windowSize} barrier={overUnder} /></div>
             <div className="xl:col-span-2"><MatchDiffersPanel ticks={ticks} windowSize={windowSize} digit={matchDigit} /></div>
             <div className="xl:col-span-2"><VolatilityPanel ticks={ticks} windowSize={windowSize} /></div>
+
+            {/* Circular visualizations — same live data, radial presentation */}
+            <div className="xl:col-span-2"><DigitWheel ticks={ticks} windowSize={windowSize} /></div>
+            <div className="xl:col-span-2"><VolatilityGauge ticks={ticks} windowSize={windowSize} /></div>
+            <div className="xl:col-span-2"><TickPulseRing ticks={ticks} /></div>
 
             <div className="xl:col-span-4 md:col-span-2"><TickStream ticks={ticks} windowSize={Math.min(windowSize, 200)} /></div>
             <div className="xl:col-span-2 md:col-span-2"><RecentTicksTable ticks={ticks} /></div>
