@@ -137,6 +137,7 @@ export function useAISignal() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<MarketSnapshot | null>(null);
+  const [lastAnalyzed, setLastAnalyzed] = useState<number | null>(null);
 
   const analyze = useCallback(async (ticks: Tick[], symbol: string, windowSize: number) => {
     if (ticks.length < 20) {
@@ -183,6 +184,7 @@ export function useAISignal() {
       const clean = raw.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(clean) as AISignal;
       setSignal(parsed);
+      setLastAnalyzed(Date.now());
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
@@ -190,5 +192,5 @@ export function useAISignal() {
     }
   }, []);
 
-  return { signal, loading, error, snapshot, analyze };
+  return { signal, loading, error, snapshot, analyze, lastAnalyzed };
 }

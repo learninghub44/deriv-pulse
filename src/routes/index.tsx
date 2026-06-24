@@ -126,10 +126,11 @@ function Index() {
   const [showJournal, setShowJournal] = useState(false);
   const [showAlerts, setShowAlerts] = useState(true);
   const [showAI, setShowAI] = useState(false);
+  const [alertConfig, setAlertConfig] = useState<Partial<import("@/hooks/use-alerts").AlertConfig>>({});
 
   const { user, profile, loading: authLoading, signOut } = useAuth();
   const { watchlists, defaultList, addSymbol, removeSymbol } = useWatchlists(user?.id);
-  const { alerts, dismiss, clearAll } = useAlerts(ticks, symbol, windowSize);
+  const { alerts, dismiss, clearAll, testAlarm } = useAlerts(ticks, symbol, windowSize, alertConfig);
 
   const { ticks, status } = useDerivTicks(symbol);
 
@@ -213,7 +214,14 @@ function Index() {
             {showAlerts && (
               <div className="xl:col-span-3 md:col-span-2">
                 <Panel title="Pattern Alerts" subtitle={alerts.length > 0 ? `${alerts.length} active` : "monitoring"}>
-                  <AlertsPanel alerts={alerts} onDismiss={dismiss} onClearAll={clearAll} />
+                  <AlertsPanel
+                    alerts={alerts}
+                    onDismiss={dismiss}
+                    onClearAll={clearAll}
+                    config={alertConfig}
+                    onConfigChange={(cfg) => setAlertConfig((prev) => ({ ...prev, ...cfg }))}
+                    testAlarm={testAlarm}
+                  />
                 </Panel>
               </div>
             )}
@@ -264,82 +272,132 @@ function TopBar({
   const sessionChange = last && first ? last.quote - first.quote : 0;
   const sessionPct = last && first && first.quote ? (sessionChange / first.quote) * 100 : 0;
   const dir = change > 0 ? "up" : change < 0 ? "down" : "flat";
-  const dot = status === "open" ? "bg-bull" : status === "connecting" ? "bg-warn animate-pulse" : "bg-bear";
+  const dotColor = status === "open" ? "bg-bull shadow-[0_0_6px_rgba(74,222,128,0.7)]" : status === "connecting" ? "bg-warn animate-pulse" : "bg-bear";
+  const criticalAlerts = alertCount > 0;
+
   return (
-    <header className="border-b border-border bg-card/95 backdrop-blur px-3 py-2 flex items-center gap-4 sticky top-0 z-30">
+    <header className="border-b border-border bg-card/98 backdrop-blur-md px-4 py-2 flex items-center gap-4 sticky top-0 z-30" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>
+      {/* Mobile sidebar toggle */}
       <button
         onClick={onToggleSidebar}
-        className="xl:hidden rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
+        className="xl:hidden rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:border-primary/40 transition-all"
         aria-label="Toggle markets"
       >
         ☰
       </button>
-      <div className="flex items-center gap-2 min-w-0">
-        <div className="size-8 rounded bg-primary/15 border border-primary/30 grid place-items-center text-primary font-bold shrink-0">
-          D
+
+      {/* Logo + brand */}
+      <div className="flex items-center gap-3 min-w-0">
+        <div className="relative size-8 rounded bg-primary/15 border border-primary/40 grid place-items-center text-primary font-bold shrink-0 shadow-[0_0_12px_rgba(120,200,120,0.15)]">
+          <span className="text-sm font-bold tracking-tight">D</span>
+          <div className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary/60 border border-background" />
         </div>
         <div className="min-w-0">
-          <div className="text-[13px] font-semibold tracking-wide truncate">DERIV · AI INTELLIGENCE TERMINAL</div>
-          <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground truncate">
-            Digit Analytics Core · v0.2
+          <div className="text-[13px] font-semibold tracking-wide truncate text-foreground" style={{ letterSpacing: "0.06em" }}>
+            DERIV PULSE
+          </div>
+          <div className="text-[9px] uppercase tracking-[0.25em] text-muted-foreground/70 truncate">
+            AI Intelligence Terminal · v0.3
           </div>
         </div>
       </div>
-      <div className="hidden md:flex items-center gap-1 ml-2 px-2 py-1 rounded bg-secondary/60 border border-border min-w-0">
-        <span className="text-[10px] uppercase tracking-widest text-muted-foreground">SYM</span>
-        <span className="text-xs font-semibold truncate">{meta.display_name}</span>
-        <span className="text-[10px] text-muted-foreground ml-2 truncate">{meta.symbol}</span>
+
+      {/* Symbol chip */}
+      <div className="hidden md:flex items-center gap-2 px-2.5 py-1 rounded bg-secondary/70 border border-border min-w-0">
+        <span className="text-[9px] uppercase tracking-[0.2em] text-muted-foreground">SYM</span>
+        <span className="text-[12px] font-semibold truncate">{meta.display_name}</span>
+        <span className="text-[9px] text-muted-foreground ml-1 font-mono truncate">{meta.symbol}</span>
       </div>
-      <div className="ml-auto flex items-center gap-3">
+
+      {/* Price block */}
+      <div className="ml-auto flex items-center gap-4">
         <div className="text-right hidden lg:block">
-          <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Last</div>
-          <div className={`text-xl font-bold tabular-nums leading-none ${dir === "up" ? "text-bull" : dir === "down" ? "text-bear" : "text-foreground"}`}>
+          <div className="text-[9px] uppercase tracking-[0.2em] text-muted-foreground">Last Price</div>
+          <div className={`text-xl font-bold tabular-nums leading-none tracking-tight ${dir === "up" ? "text-bull" : dir === "down" ? "text-bear" : "text-foreground"}`} style={{ fontFamily: "'JetBrains Mono', monospace" }}>
             {last ? last.quote.toFixed(last.pip_size) : "—"}
           </div>
         </div>
         <div className="text-right hidden sm:block">
-          <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Session Δ</div>
-          <div className={`text-sm tabular-nums leading-none ${sessionChange > 0 ? "text-bull" : sessionChange < 0 ? "text-bear" : ""}`}>
+          <div className="text-[9px] uppercase tracking-[0.2em] text-muted-foreground">Session</div>
+          <div className={`text-sm tabular-nums leading-none font-mono ${sessionChange > 0 ? "text-bull" : sessionChange < 0 ? "text-bear" : "text-muted-foreground"}`}>
             {sessionChange >= 0 ? "+" : ""}{sessionChange.toFixed(last?.pip_size ?? 2)}
             <span className="text-[10px] text-muted-foreground ml-1">({sessionPct >= 0 ? "+" : ""}{sessionPct.toFixed(3)}%)</span>
           </div>
         </div>
-        <div className="flex items-center gap-2 text-[11px]">
-          <span className={`size-2 rounded-full ${dot}`} />
-          <span className="uppercase tracking-widest text-muted-foreground hidden sm:inline">{status}</span>
+
+        {/* Feed status */}
+        <div className="flex items-center gap-2 text-[10px]">
+          <span className={`size-2 rounded-full ${dotColor}`} />
+          <span className="uppercase tracking-[0.2em] text-muted-foreground hidden sm:inline font-mono">{status}</span>
         </div>
+
+        {/* Action buttons */}
         {!authLoading && (
-          <div className="flex items-center gap-2 border-l border-border pl-3">
+          <div className="flex items-center gap-1.5 border-l border-border pl-3">
+            {/* Alerts — always visible */}
+            <button
+              onClick={onToggleAlerts}
+              className={`relative px-2.5 py-1 rounded border text-[9px] uppercase tracking-[0.15em] font-mono transition-all ${
+                showAlerts
+                  ? "border-amber-500/60 text-amber-300 bg-amber-500/10 shadow-[0_0_8px_rgba(245,158,11,0.1)]"
+                  : "border-border text-muted-foreground hover:text-foreground hover:border-border/80"
+              }`}
+            >
+              ◎ Alerts
+              {alertCount > 0 && (
+                <span className={`absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full text-[8px] font-bold grid place-items-center ${criticalAlerts ? "bg-red-500 text-white shadow-[0_0_6px_rgba(239,68,68,0.7)]" : "bg-amber-500 text-black"}`}>
+                  {alertCount > 99 ? "99+" : alertCount}
+                </span>
+              )}
+            </button>
+
             {user ? (
               <>
-                <button onClick={onToggleAlerts} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors relative ${showAlerts ? "border-yellow-500/60 text-yellow-400 bg-yellow-500/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
-                  Alerts{alertCount > 0 && <span className="ml-1 text-[8px] bg-yellow-500 text-black rounded-full px-1">{alertCount}</span>}
+                <button
+                  onClick={onToggleAI}
+                  className={`px-2.5 py-1 rounded border text-[9px] uppercase tracking-[0.15em] font-mono transition-all ${
+                    showAI
+                      ? "border-primary/60 text-primary bg-primary/10 shadow-[0_0_8px_rgba(120,200,120,0.1)]"
+                      : "border-border text-muted-foreground hover:text-foreground hover:border-border/80"
+                  }`}
+                >
+                  ◈ AI Signal
                 </button>
-                <button onClick={onToggleAI} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors ${showAI ? "border-primary text-primary bg-primary/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
-                  AI Signal
+                <button
+                  onClick={onToggleJournal}
+                  className={`px-2.5 py-1 rounded border text-[9px] uppercase tracking-[0.15em] font-mono transition-all ${
+                    showJournal
+                      ? "border-accent/60 text-accent bg-accent/10"
+                      : "border-border text-muted-foreground hover:text-foreground hover:border-border/80"
+                  }`}
+                >
+                  ☰ Journal
                 </button>
-                <button onClick={onToggleJournal} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors ${showJournal ? "border-primary text-primary bg-primary/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
-                  Journal
-                </button>
-                <span className="text-[10px] text-muted-foreground hidden md:block truncate max-w-[100px]">
+                <span className="text-[9px] text-muted-foreground hidden lg:block font-mono truncate max-w-[90px]">
                   {profile?.display_name ?? user.email?.split("@")[0]}
                 </span>
-                <button onClick={onSignOut} className="px-2 py-1 rounded border border-border text-[10px] uppercase tracking-widest text-muted-foreground hover:text-bear hover:border-bear transition-colors">
-                  Sign Out
+                <button
+                  onClick={onSignOut}
+                  className="px-2 py-1 rounded border border-border text-[9px] uppercase tracking-[0.15em] font-mono text-muted-foreground hover:text-bear hover:border-bear/60 transition-all"
+                >
+                  Exit
                 </button>
               </>
             ) : (
-              <>
-                <button onClick={onToggleAlerts} className={`px-2 py-1 rounded border text-[10px] uppercase tracking-widest transition-colors relative ${showAlerts ? "border-yellow-500/60 text-yellow-400 bg-yellow-500/10" : "border-border text-muted-foreground hover:text-foreground"}`}>
-                  Alerts{alertCount > 0 && <span className="ml-1 text-[8px] bg-yellow-500 text-black rounded-full px-1">{alertCount}</span>}
-                </button>
-                <button onClick={onSignIn} className="px-2 py-1 rounded border border-primary text-[10px] uppercase tracking-widest text-primary bg-primary/10 hover:bg-primary/20 transition-colors">
-                  Sign In
-                </button>
-              </>
+              <button
+                onClick={onSignIn}
+                className="px-2.5 py-1 rounded border border-primary/60 text-[9px] uppercase tracking-[0.15em] font-mono text-primary bg-primary/10 hover:bg-primary/20 transition-all"
+              >
+                Sign In
+              </button>
             )}
           </div>
         )}
+      </div>
+
+      {/* Copyright watermark — subtle, on right */}
+      <div className="hidden xl:block absolute bottom-0.5 right-3 text-[8px] font-mono text-muted-foreground/25 select-none pointer-events-none">
+        © {new Date().getFullYear()} Deriv Pulse · Proprietary
       </div>
     </header>
   );
@@ -501,24 +559,26 @@ function StatusBar({
   const last = ticks[ticks.length - 1];
   const ago = useFreshness(last?.epoch);
   return (
-    <footer className="border-t border-border bg-card/95 px-3 py-1.5 text-[10px] uppercase tracking-widest text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 sticky bottom-0 z-30">
-      <span>
+    <footer className="border-t border-border bg-card/98 px-4 py-1.5 text-[9px] uppercase tracking-[0.18em] text-muted-foreground flex flex-wrap items-center gap-x-5 gap-y-1 sticky bottom-0 z-30" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+      <span className="flex items-center gap-1.5">
+        <span className={`size-1.5 rounded-full ${status === "open" ? "bg-bull" : "bg-bear"}`} />
         Feed <span className={status === "open" ? "text-bull" : "text-bear"}>{status}</span>
       </span>
       <span>
-        Rate <span className="text-foreground tabular-nums">{tickRate.toFixed(2)}</span> tps
+        Rate <span className="text-foreground tabular-nums">{tickRate.toFixed(2)}</span> t/s
       </span>
       <span>
         Buffer <span className="text-foreground tabular-nums">{ticks.length}</span>
       </span>
       <span>
-        Last <span className="text-foreground tabular-nums">{ago}</span>
+        Freshness <span className="text-foreground tabular-nums">{ago}</span>
       </span>
       <span>
         Pip <span className="text-foreground tabular-nums">{last?.pip_size ?? "—"}</span>
       </span>
-      <span className="ml-auto">
-        {symbolCount} markets · {MARKET_LABEL[meta.market] ?? meta.market}
+      <span className="ml-auto flex items-center gap-4">
+        <span>{symbolCount} markets · {MARKET_LABEL[meta.market] ?? meta.market}</span>
+        <span className="text-muted-foreground/40 select-none">© {new Date().getFullYear()} Deriv Pulse — All Rights Reserved</span>
       </span>
     </footer>
   );
@@ -538,10 +598,16 @@ function Panel({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-lg border border-border bg-card p-3 h-full flex flex-col">
-      <div className="flex items-baseline justify-between mb-2">
-        <h2 className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">{title}</h2>
-        {subtitle && <span className="text-[10px] text-muted-foreground tabular-nums">{subtitle}</span>}
+    <section className="rounded-lg border border-border bg-card p-3 h-full flex flex-col relative overflow-hidden">
+      {/* Top accent line */}
+      <div className="absolute top-0 left-4 right-4 h-px bg-gradient-to-r from-transparent via-primary/20 to-transparent" />
+      <div className="flex items-baseline justify-between mb-2.5">
+        <h2 className="text-[9px] uppercase tracking-[0.25em] text-muted-foreground/80" style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 500 }}>
+          {title}
+        </h2>
+        {subtitle && (
+          <span className="text-[9px] text-muted-foreground/60 tabular-nums font-mono">{subtitle}</span>
+        )}
       </div>
       <div className="flex-1 min-h-0">{children}</div>
     </section>
@@ -1011,8 +1077,8 @@ function Stat({
     tone === "bull" ? "text-bull" : tone === "bear" ? "text-bear" : tone === "warn" ? "text-warn" : "";
   return (
     <div className="flex-1 min-w-0">
-      <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{label}</div>
-      <div className={`tabular-nums font-bold leading-tight truncate ${big ? "text-2xl" : "text-sm"} ${color}`}>
+      <div className="text-[8px] uppercase tracking-[0.22em] text-muted-foreground/70" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>{label}</div>
+      <div className={`tabular-nums font-bold leading-tight truncate ${big ? "text-2xl" : "text-sm"} ${color}`} style={{ fontFamily: "'JetBrains Mono', monospace" }}>
         {value}
       </div>
     </div>
@@ -1046,11 +1112,17 @@ function Empty() {
 
 function Disclaimer() {
   return (
-    <div className="rounded border border-border bg-card/60 p-2.5 text-[11px] text-muted-foreground leading-relaxed">
-      <span className="text-warn font-semibold uppercase tracking-widest">Notice ·</span> This terminal
-      provides statistical analysis of historical and live tick data streamed directly from the Deriv API.
-      Past distributions are not predictions of future ticks. Nothing here is financial advice or a
-      guarantee of profit.
+    <div className="rounded border border-border/60 bg-card/40 px-4 py-3 flex flex-col gap-1" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+      <div className="flex items-center gap-2">
+        <span className="text-warn text-[9px] font-semibold uppercase tracking-[0.25em]">Risk Disclosure</span>
+        <div className="flex-1 h-px bg-border/40" />
+        <span className="text-[8px] text-muted-foreground/40 tracking-widest select-none">© {new Date().getFullYear()} DERIV PULSE · PROPRIETARY SOFTWARE · ALL RIGHTS RESERVED</span>
+      </div>
+      <p className="text-[10px] text-muted-foreground/70 leading-relaxed">
+        This terminal provides statistical analysis of historical and live tick data streamed directly from the Deriv API.
+        Past distributions are not predictions of future ticks. Nothing here constitutes financial advice or a guarantee of profit.
+        Synthetic index tick patterns are determined by certified random number generators. Trade responsibly.
+      </p>
     </div>
   );
 }
