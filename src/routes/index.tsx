@@ -7,15 +7,18 @@ import {
   type Tick,
 } from "@/hooks/use-deriv-ticks";
 import { useAuth } from "@/hooks/use-auth";
+import { useDerivOAuth } from "@/hooks/use-deriv-oauth";
 import { useWatchlists } from "@/hooks/use-watchlists";
 import { useAlerts } from "@/hooks/use-alerts";
 import { AuthModal } from "@/components/auth/AuthModal";
+import { DerivAuthPanel } from "@/components/auth/DerivAuthPanel";
 import { TradeJournalPanel } from "@/components/journal/TradeJournalPanel";
 import { AlertsPanel } from "@/components/alerts/AlertsPanel";
 import { AISignalPanel } from "@/components/ai/AISignalPanel";
 import { MarketAnalyzerPanel } from "@/components/ai/MarketAnalyzerPanel";
 import { EntryPointScanner } from "@/components/signals/EntryPointScanner";
 import { DigitWheel, VolatilityGauge, TickPulseRing } from "@/components/charts/CircularPanels";
+import { TradingPanel } from "@/components/trading/TradingPanel";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -131,11 +134,14 @@ function Index() {
   const [showAI, setShowAI] = useState(false);
   const [showAnalyzer, setShowAnalyzer] = useState(false);
   const [showScanner, setShowScanner] = useState(true);
+  const [showTrading, setShowTrading] = useState(false);
+  const [showDerivAuth, setShowDerivAuth] = useState(false);
   const [alertConfig, setAlertConfig] = useState<Partial<import("@/hooks/use-alerts").AlertConfig>>({});
 
   const { user, profile, loading: authLoading, signOut } = useAuth();
   const { watchlists, defaultList, addSymbol, removeSymbol } = useWatchlists(user?.id);
-  const { ticks, status } = useDerivTicks(symbol);
+  const derivOAuth = useDerivOAuth();
+  const { ticks, status } = useDerivTicks(symbol, derivOAuth.authenticatedWsUrl ?? undefined);
 
   const { alerts, dismiss, clearAll, testAlarm } = useAlerts(ticks, symbol, windowSize, alertConfig);
 
@@ -183,6 +189,11 @@ function Index() {
           showAnalyzer={showAnalyzer}
           onToggleScanner={() => setShowScanner((v) => !v)}
           showScanner={showScanner}
+          onToggleTrading={() => setShowTrading((v) => !v)}
+          showTrading={showTrading}
+          derivConnected={derivOAuth.isAuthenticated}
+          onToggleDerivAuth={() => setShowDerivAuth((v) => !v)}
+          showDerivAuth={showDerivAuth}
         />
       <div className="flex-1 grid grid-cols-1 xl:grid-cols-[260px_1fr] min-h-0">
         <SymbolSidebar
@@ -269,6 +280,43 @@ function Index() {
                 <TradeJournalPanel userId={user.id} currentSymbol={symbol} />
               </div>
             )}
+
+            {showDerivAuth && (
+              <div className="xl:col-span-3 md:col-span-2">
+                <Panel title="Deriv Account" subtitle="OAuth 2.0 · PKCE">
+                  <DerivAuthPanel />
+                </Panel>
+              </div>
+            )}
+
+            {showTrading && (
+              <div className={showDerivAuth ? "xl:col-span-3 md:col-span-2" : "xl:col-span-3 md:col-span-2"}>
+                <Panel title="Live Trading" subtitle={derivOAuth.activeAccount ? `${derivOAuth.activeAccount.account_type.toUpperCase()} · ${derivOAuth.activeAccount.account_id}` : "Connect Deriv account"}>
+                  {derivOAuth.isAuthenticated ? (
+                    <TradingPanel
+                      wsUrl={derivOAuth.authenticatedWsUrl}
+                      symbol={symbol}
+                      currentPrice={ticks[ticks.length - 1]?.quote}
+                      pipSize={ticks[ticks.length - 1]?.pip_size ?? meta.pip ? Math.round(-Math.log10(meta.pip)) : 2}
+                      accounts={derivOAuth.accounts}
+                      activeAccount={derivOAuth.activeAccount}
+                      onSwitchAccount={(id) => derivOAuth.switchAccount(id)}
+                    />
+                  ) : (
+                    <div className="flex flex-col items-center justify-center py-10 gap-3 text-center">
+                      <div className="text-2xl opacity-15">⚡</div>
+                      <p className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground">Deriv account not connected</p>
+                      <button
+                        onClick={() => setShowDerivAuth(true)}
+                        className="px-3 py-1.5 rounded border border-primary/50 text-primary text-[9px] font-mono uppercase tracking-widest hover:bg-primary/10 transition-colors"
+                      >
+                        Connect Deriv
+                      </button>
+                    </div>
+                  )}
+                </Panel>
+              </div>
+            )}
           </main>
         </div>
       </div>
@@ -288,6 +336,8 @@ function TopBar({
   onToggleAlerts, showAlerts, alertCount, onToggleAI, showAI,
   onToggleAnalyzer, showAnalyzer,
   onToggleScanner, showScanner,
+  onToggleTrading, showTrading,
+  derivConnected, onToggleDerivAuth, showDerivAuth,
 }: {
   status: string; meta: SymbolMeta; ticks: Tick[]; onToggleSidebar: () => void;
   user: import("@supabase/supabase-js").User | null;
@@ -298,6 +348,8 @@ function TopBar({
   onToggleAI: () => void; showAI: boolean;
   onToggleAnalyzer: () => void; showAnalyzer: boolean;
   onToggleScanner: () => void; showScanner: boolean;
+  onToggleTrading: () => void; showTrading: boolean;
+  derivConnected: boolean; onToggleDerivAuth: () => void; showDerivAuth: boolean;
 }) {
   const last = ticks[ticks.length - 1];
   const prev = ticks[ticks.length - 2];
@@ -331,7 +383,7 @@ function TopBar({
             DERIV PULSE
           </div>
           <div className="text-[9px] uppercase tracking-[0.25em] text-muted-foreground/70 truncate">
-            AI Intelligence Terminal · v0.3
+            AI Intelligence Terminal · v0.4
           </div>
         </div>
       </div>
@@ -416,6 +468,32 @@ function TopBar({
                   }`}
                 >
                   ⚡ Scanner
+                </button>
+
+                {/* Deriv connect button — always visible when user logged in */}
+                <button
+                  onClick={onToggleDerivAuth}
+                  className={`px-2.5 py-1 rounded border text-[9px] uppercase tracking-[0.15em] font-mono transition-all ${
+                    showDerivAuth
+                      ? "border-emerald-500/60 text-emerald-300 bg-emerald-500/10"
+                      : derivConnected
+                      ? "border-bull/40 text-bull/80 bg-bull/5"
+                      : "border-border text-muted-foreground hover:text-foreground hover:border-border/80"
+                  }`}
+                >
+                  {derivConnected ? "◉ Deriv" : "○ Deriv"}
+                </button>
+
+                {/* Live trading button */}
+                <button
+                  onClick={onToggleTrading}
+                  className={`px-2.5 py-1 rounded border text-[9px] uppercase tracking-[0.15em] font-mono transition-all ${
+                    showTrading
+                      ? "border-bull/60 text-bull bg-bull/10 shadow-[0_0_8px_rgba(74,222,128,0.15)]"
+                      : "border-border text-muted-foreground hover:text-foreground hover:border-border/80"
+                  }`}
+                >
+                  ◈ Trade
                 </button>
                 <button
                   onClick={onToggleJournal}
