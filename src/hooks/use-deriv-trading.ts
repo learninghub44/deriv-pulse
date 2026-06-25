@@ -79,7 +79,7 @@ export interface AutoTradeConfig {
 }
 
 /* ─── Hook ───────────────────────────────────────────────────────────────── */
-export function useDerivTrading(wsUrl: string | null, accessToken?: string | null) {
+export function useDerivTrading(wsUrl: string | null) {
   const [connected, setConnected]           = useState(false);
   const [authorized, setAuthorized]         = useState(false);
   const [balance, setBalance]               = useState<Balance | null>(null);
@@ -159,36 +159,10 @@ export function useDerivTrading(wsUrl: string | null, accessToken?: string | nul
 
     ws.onopen = async () => {
       setConnected(true);
-      log("Connected");
+      setAuthorized(true); // OTP URL is pre-authenticated — no authorize message needed
+      log("Connected & authorized via OTP");
 
-      // Step 1: authorize with access token if provided (legacy WS still needs this)
-      if (accessToken) {
-        try {
-          log("Authorizing…");
-          const authData = await send<Record<string, unknown>>({ authorize: accessToken, req_id: nextId() });
-          const acct = (authData.authorize ?? authData) as Record<string, unknown>;
-          log(`Authorized as ${acct.loginid ?? "unknown"}`);
-          setAuthorized(true);
-          // Set balance from authorize response
-          if (acct.balance !== undefined) {
-            setBalance({
-              balance: Number(acct.balance),
-              currency: String(acct.currency ?? "USD"),
-              loginid: String(acct.loginid ?? ""),
-            });
-          }
-        } catch (e) {
-          log(`Auth failed: ${e}`);
-          setError(`Authorization failed: ${e}`);
-          return;
-        }
-      } else {
-        // OTP URL — already authenticated
-        setAuthorized(true);
-        log("Using OTP auth — no authorize msg needed");
-      }
-
-      // Step 2: subscribe to balance stream
+      // Subscribe to balance stream
       const balRid = nextId();
       streamers.current.set(balRid, (data) => {
         const b = data.balance as Record<string, unknown> | undefined;
@@ -356,7 +330,7 @@ export function useDerivTrading(wsUrl: string | null, accessToken?: string | nul
       if (pingRef.current) clearInterval(pingRef.current);
       ws.close();
     };
-  }, [wsUrl, accessToken, send]);
+  }, [wsUrl, send]);
 
   /* ── Get proposal (streaming) ── */
   const getProposal = useCallback(async (params: ProposalParams) => {

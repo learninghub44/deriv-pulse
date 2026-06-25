@@ -17,7 +17,6 @@ const NEEDS_BARRIER = new Set(["HIGHER", "LOWER", "ONETOUCH", "NOTOUCH", "DIGITM
 
 interface TradingPanelProps {
   wsUrl: string | null;
-  accessToken?: string | null;
   symbol: string;
   currentPrice?: number;
   pipSize?: number;
@@ -28,14 +27,14 @@ interface TradingPanelProps {
 
 type Tab = "trade" | "auto" | "positions" | "history" | "log";
 
-export function TradingPanel({ wsUrl, accessToken, symbol, currentPrice, pipSize = 2, accounts, activeAccount, onSwitchAccount }: TradingPanelProps) {
+export function TradingPanel({ wsUrl, symbol, currentPrice, pipSize = 2, accounts, activeAccount, onSwitchAccount }: TradingPanelProps) {
   const {
     connected, authorized, balance, proposal, proposalLoading,
     openContracts, buying, error, lastTrade, tradeHistory,
     autoRunning, autoStats, wsLog,
     getProposal, buyContract, sellContract, clearProposal,
     startAutoTrade, stopAutoTrade,
-  } = useDerivTrading(wsUrl, accessToken);
+  } = useDerivTrading(wsUrl);
 
   const [tab, setTab]               = useState<Tab>("trade");
   const [contractType, setContractType] = useState("CALL");
