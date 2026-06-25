@@ -4,14 +4,15 @@ export type Tick = { quote: number; epoch: number; pip_size: number };
 export type Status = "idle" | "connecting" | "open" | "closed" | "error" | "reconnecting";
 
 /* ─── API constants ──────────────────────────────────────────────────────── */
-const PUBLIC_WS_URL  = "wss://api.derivws.com/trading/v1/options/ws/public";
-const LEGACY_WS_URL  = `wss://ws.derivws.com/websockets/v3?app_id=1089`;  // fallback for public data
-const REST_BASE      = "https://api.derivws.com";
+// Public tick stream — legacy WS (new public endpoint is unreliable for proposals)
+export const LEGACY_WS  = (appId: string) => `wss://ws.derivws.com/websockets/v3?app_id=${appId}`;
+export const DEFAULT_APP_ID = "1089";  // public read-only app_id for tick data
+const REST_BASE = "https://api.derivws.com";
+
 const BUFFER         = 1000;
 const PING_INTERVAL  = 25_000;
 const MAX_RECONNECTS = 8;
 
-/* ─── Reconnect backoff ──────────────────────────────────────────────────── */
 function backoff(attempt: number): number {
   return Math.min(30_000, 500 * Math.pow(2, attempt) + Math.random() * 300);
 }
@@ -21,21 +22,18 @@ export async function generatePKCE(): Promise<{ codeVerifier: string; codeChalle
   const array = crypto.getRandomValues(new Uint8Array(64));
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
   const codeVerifier = Array.from(array).map((v) => chars[v % chars.length]).join("");
-
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier));
   const codeChallenge = btoa(String.fromCharCode(...new Uint8Array(hash)))
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-
   const stateArr = crypto.getRandomValues(new Uint8Array(16));
   const state = Array.from(stateArr).map((b) => b.toString(16).padStart(2, "0")).join("");
-
   return { codeVerifier, codeChallenge, state };
 }
 
 export function buildDerivAuthURL(opts: {
   clientId: string;
   redirectUri: string;
-  scope?: "trade" | "admin";
+  scope?: string;
   codeChallenge: string;
   state: string;
   signup?: boolean;
@@ -45,7 +43,7 @@ export function buildDerivAuthURL(opts: {
     response_type: "code",
     client_id: opts.clientId,
     redirect_uri: opts.redirectUri,
-    scope: opts.scope ?? "trade",
+    scope: opts.scope ?? "trade admin",
     state: opts.state,
     code_challenge: opts.codeChallenge,
     code_challenge_method: "S256",
@@ -85,12 +83,23 @@ export async function getAuthenticatedWsUrl(accountId: string, accessToken: stri
     },
   });
   if (!res.ok) throw new Error(`OTP request failed: ${res.status}`);
-  const { data } = await res.json();
-  return data.url as string;
+  const json = await res.json();
+  // New API returns { data: { url: "wss://..." } } or { url: "wss://..." }
+  return (json.data?.url ?? json.url) as string;
 }
 
-/* ─── REST: list accounts ────────────────────────────────────────────────── */
-export async function fetchDerivAccounts(accessToken: string, appId?: string) {
+/* ─── REST: list accounts — also extracts api_token per account ──────────── */
+export interface DerivAccountRaw {
+  account_id: string;
+  balance: number;
+  currency: string;
+  account_type: string;
+  status: string;
+  api_token?: string;   // returned by some Deriv OAuth flows
+  token?: string;        // alternate field name
+}
+
+export async function fetchDerivAccounts(accessToken: string, appId?: string): Promise<DerivAccountRaw[]> {
   const res = await fetch(`${REST_BASE}/trading/v1/options/accounts`, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -99,25 +108,28 @@ export async function fetchDerivAccounts(accessToken: string, appId?: string) {
   });
   if (!res.ok) throw new Error(`Accounts fetch failed: ${res.status}`);
   const { data } = await res.json();
-  return data as Array<{ account_id: string; balance: number; currency: string; account_type: string; status: string }>;
+  return data as DerivAccountRaw[];
 }
 
-/* ─── Active symbols (new API field names) ───────────────────────────────── */
+/* ─── Build legacy WS URL for trading (pre-authenticated via authorize msg) ─ */
+export function buildTradingWsUrl(appId?: string): string {
+  return LEGACY_WS(appId ?? DEFAULT_APP_ID);
+}
+
+/* ─── Active symbols ─────────────────────────────────────────────────────── */
 export async function fetchActiveSymbols(): Promise<
   Array<{ symbol: string; display_name: string; market: string; submarket: string; pip: number }>
 > {
   return new Promise((resolve, reject) => {
-    // Try new public endpoint first, fall back to legacy
     let ws: WebSocket;
     let resolved = false;
 
-    const tryConnect = (url: string) => {
+    const tryConnect = (url: string, appId: string) => {
       ws = new WebSocket(url);
       const timeout = setTimeout(() => {
         ws.close();
-        if (!resolved && url === PUBLIC_WS_URL) {
-          // Try legacy
-          tryConnect(LEGACY_WS_URL);
+        if (!resolved && appId === DEFAULT_APP_ID) {
+          tryConnect(LEGACY_WS("36544"), "36544");
         } else if (!resolved) {
           reject(new Error("timeout"));
         }
@@ -129,170 +141,121 @@ export async function fetchActiveSymbols(): Promise<
 
       ws.onmessage = (ev) => {
         try {
-          const msg = JSON.parse(ev.data as string);
-          // Support both new API (underlying_symbol) and legacy (symbol)
-          const syms = msg.active_symbols as Record<string, unknown>[] | undefined;
-          if (syms) {
+          const data = JSON.parse(ev.data as string);
+          if (data.msg_type === "active_symbols") {
             clearTimeout(timeout);
             resolved = true;
+            ws.close();
+            const raw = data.active_symbols as Array<Record<string, unknown>>;
             resolve(
-              syms.map((s) => ({
-                symbol: String(s.underlying_symbol ?? s.symbol),
-                display_name: String(s.underlying_symbol_name ?? s.display_name),
-                market: String(s.market),
-                submarket: String(s.submarket),
-                pip: Number(s.pip_size ?? s.pip) || 0.01,
+              raw.map((s) => ({
+                symbol: String(s.underlying_symbol ?? s.symbol ?? ""),
+                display_name: String(s.underlying_symbol_name ?? s.display_name ?? ""),
+                market: String(s.market ?? ""),
+                submarket: String(s.submarket ?? ""),
+                pip: Number(s.pip ?? 0.01),
               }))
             );
-            ws.close();
           }
-        } catch (e) {
-          reject(e);
-        }
+        } catch { /* ignore parse errors */ }
       };
-
-      ws.onerror = () => {
-        clearTimeout(timeout);
-        if (!resolved && url === PUBLIC_WS_URL) {
-          tryConnect(LEGACY_WS_URL);
-        } else if (!resolved) {
-          reject(new Error("ws error"));
-        }
-      };
+      ws.onerror = () => { clearTimeout(timeout); };
     };
 
-    tryConnect(PUBLIC_WS_URL);
+    tryConnect(LEGACY_WS(DEFAULT_APP_ID), DEFAULT_APP_ID);
   });
 }
 
-/* ─── Main tick hook ─────────────────────────────────────────────────────── */
-export function useDerivTicks(symbol: string, wsUrl?: string) {
-  const [ticks, setTicks] = useState<Tick[]>([]);
+/* ─── Hook ───────────────────────────────────────────────────────────────── */
+export function useDerivTicks(symbol: string, tradingWsUrl?: string | null) {
+  const [ticks, setTicks]   = useState<Tick[]>([]);
   const [status, setStatus] = useState<Status>("idle");
-  const wsRef     = useRef<WebSocket | null>(null);
-  const subIdRef  = useRef<string | null>(null);
-  const pingRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const reconnRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const attempt   = useRef(0);
-  const dead      = useRef(false);
+
+  const wsRef        = useRef<WebSocket | null>(null);
+  const reconnectRef = useRef(0);
+  const pingRef      = useRef<ReturnType<typeof setInterval> | null>(null);
+  const subRef       = useRef<string | null>(null);
+  const mountedRef   = useRef(true);
 
   const connect = useCallback(() => {
-    if (dead.current) return;
+    if (!mountedRef.current) return;
 
-    // Choose URL: authenticated > new public > legacy public
-    const url = wsUrl ?? PUBLIC_WS_URL;
-
-    setStatus(attempt.current === 0 ? "connecting" : "reconnecting");
+    // Use legacy WS for public tick data — reliable and well-tested
+    const url = LEGACY_WS(DEFAULT_APP_ID);
+    setStatus("connecting");
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
-      attempt.current = 0;
+      if (!mountedRef.current) { ws.close(); return; }
       setStatus("open");
-
-      // Subscribe to history + live ticks
-      ws.send(JSON.stringify({
-        ticks_history: symbol,
-        adjust_start_time: 1,
-        count: BUFFER,
-        end: "latest",
-        start: 1,
-        style: "ticks",
-        subscribe: 1,
-      }));
-
-      // Keepalive ping
+      reconnectRef.current = 0;
+      ws.send(JSON.stringify({ ticks_history: symbol, adjust_start_time: 1, count: BUFFER, end: "latest", style: "ticks", subscribe: 1 }));
       if (pingRef.current) clearInterval(pingRef.current);
       pingRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ ping: 1 }));
-        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ping: 1 }));
       }, PING_INTERVAL);
     };
 
     ws.onmessage = (ev) => {
+      if (!mountedRef.current) return;
       try {
-        const msg = JSON.parse(ev.data as string) as Record<string, unknown>;
-        if (msg.error) {
-          console.error("[DerivWS] Error:", (msg.error as Record<string, unknown>).message);
-          return;
-        }
-        if (msg.msg_type === "ping") return; // pong handled
+        const data = JSON.parse(ev.data as string);
+        const pip = data.pip_size ?? data.tick?.pip_size ?? 0.01;
 
-        if (msg.msg_type === "history" && msg.history) {
-          const pip = (msg.pip_size as number) ?? 2;
-          const h   = msg.history as { prices: number[]; times: number[] };
-          const hist: Tick[] = h.prices.map((p, i) => ({
-            quote: Number(p),
-            epoch: Number(h.times[i]),
-            pip_size: pip,
-          }));
-          const sub = msg.subscription as { id?: string } | undefined;
-          if (sub?.id) subIdRef.current = sub.id;
-          setTicks(hist.slice(-BUFFER));
-        } else if (msg.msg_type === "tick" && msg.tick) {
-          const t = msg.tick as { quote: number; epoch: number; pip_size?: number };
-          const tick: Tick = {
-            quote: Number(t.quote),
-            epoch: Number(t.epoch),
-            pip_size: t.pip_size ?? 2,
-          };
-          const sub = msg.subscription as { id?: string } | undefined;
-          if (sub?.id) subIdRef.current = sub.id;
-          setTicks((prev) => {
-            const next = prev.length >= BUFFER ? prev.slice(1) : [...prev];
-            next.push(tick);
-            return next;
-          });
+        if (data.msg_type === "history") {
+          const prices = (data.history?.prices as number[]) ?? [];
+          const times  = (data.history?.times  as number[]) ?? [];
+          const hist: Tick[] = prices.map((q, i) => ({ quote: q, epoch: times[i] ?? 0, pip_size: pip }));
+          setTicks(hist);
+          subRef.current = data.subscription?.id ?? null;
         }
-      } catch (e) {
-        console.error("[DerivWS] Parse error:", e);
-      }
-    };
-
-    ws.onerror = () => {
-      if (pingRef.current) clearInterval(pingRef.current);
-      setStatus("error");
+        if (data.msg_type === "tick") {
+          const t = data.tick as Record<string, unknown>;
+          if (t) {
+            setTicks(prev => {
+              const next = [...prev, { quote: Number(t.quote), epoch: Number(t.epoch), pip_size: pip }];
+              return next.length > BUFFER ? next.slice(-BUFFER) : next;
+            });
+          }
+        }
+      } catch { /* ignore */ }
     };
 
     ws.onclose = () => {
       if (pingRef.current) clearInterval(pingRef.current);
-      if (dead.current) { setStatus("closed"); return; }
-      if (attempt.current < MAX_RECONNECTS) {
-        setStatus("reconnecting");
-        const delay = backoff(attempt.current++);
-        reconnRef.current = setTimeout(connect, delay);
+      if (!mountedRef.current) return;
+      setStatus("reconnecting");
+      const attempt = reconnectRef.current++;
+      if (attempt < MAX_RECONNECTS) {
+        setTimeout(connect, backoff(attempt));
       } else {
         setStatus("error");
       }
     };
-  }, [symbol, wsUrl]);
+
+    ws.onerror = () => { setStatus("error"); };
+  }, [symbol]);
 
   useEffect(() => {
-    dead.current = false;
-    attempt.current = 0;
+    mountedRef.current = true;
     setTicks([]);
+    reconnectRef.current = 0;
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
     connect();
-
     return () => {
-      dead.current = true;
-      if (pingRef.current)  clearInterval(pingRef.current);
-      if (reconnRef.current) clearTimeout(reconnRef.current);
-      const ws = wsRef.current;
-      if (ws) {
-        if (subIdRef.current && ws.readyState === WebSocket.OPEN) {
-          try { ws.send(JSON.stringify({ forget: subIdRef.current })); } catch { /* noop */ }
-        }
-        ws.close();
-      }
+      mountedRef.current = false;
+      if (pingRef.current) clearInterval(pingRef.current);
+      if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
     };
   }, [connect]);
 
   return { ticks, status };
 }
 
-/* ─── Utility ────────────────────────────────────────────────────────────── */
+/* ─── Utility: extract last digit from a tick quote ─────────────────────── */
 export function lastDigit(quote: number, pipSize: number): number {
-  const s = quote.toFixed(pipSize);
-  return Number(s[s.length - 1]);
+  const decimals = Math.round(-Math.log10(pipSize));
+  const str = quote.toFixed(decimals);
+  return Number(str[str.length - 1]);
 }

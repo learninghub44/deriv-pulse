@@ -144,10 +144,10 @@ function Index() {
 
   // Auto-open trading panel when Deriv account connects
   useEffect(() => {
-    if (derivOAuth.isAuthenticated && derivOAuth.authenticatedWsUrl) {
+    if (derivOAuth.isAuthenticated) {
       setShowTrading(true);
     }
-  }, [derivOAuth.isAuthenticated, derivOAuth.authenticatedWsUrl]);
+  }, [derivOAuth.isAuthenticated]);
   const { ticks, status } = useDerivTicks(symbol); // public WS — authenticated WS is for trading only
 
   const { alerts, dismiss, clearAll, testAlarm } = useAlerts(ticks, symbol, windowSize, alertConfig);
@@ -301,7 +301,7 @@ function Index() {
                 <Panel title="Live Trading" subtitle={derivOAuth.activeAccount ? `${derivOAuth.activeAccount.account_type.toUpperCase()} · ${derivOAuth.activeAccount.account_id}` : "Connect Deriv account"}>
                   {derivOAuth.isAuthenticated ? (
                     <TradingPanel
-                      wsUrl={derivOAuth.authenticatedWsUrl}
+                      apiToken={derivOAuth.activeApiToken}
                       symbol={symbol}
                       currentPrice={ticks[ticks.length - 1]?.quote}
                       pipSize={ticks[ticks.length - 1]?.pip_size ?? meta.pip ? Math.round(-Math.log10(meta.pip)) : 2}

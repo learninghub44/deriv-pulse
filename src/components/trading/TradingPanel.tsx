@@ -16,7 +16,7 @@ const DUR_UNITS = [
 const NEEDS_BARRIER = new Set(["HIGHER", "LOWER", "ONETOUCH", "NOTOUCH", "DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER"]);
 
 interface TradingPanelProps {
-  wsUrl: string | null;
+  apiToken: string | null;
   symbol: string;
   currentPrice?: number;
   pipSize?: number;
@@ -27,14 +27,14 @@ interface TradingPanelProps {
 
 type Tab = "trade" | "auto" | "positions" | "history" | "log";
 
-export function TradingPanel({ wsUrl, symbol, currentPrice, pipSize = 2, accounts, activeAccount, onSwitchAccount }: TradingPanelProps) {
+export function TradingPanel({ apiToken, symbol, currentPrice, pipSize = 2, accounts, activeAccount, onSwitchAccount }: TradingPanelProps) {
   const {
-    connected, authorized, balance, proposal, proposalLoading,
+    connected, authorized, authError, balance, proposal, proposalLoading,
     openContracts, buying, error, lastTrade, tradeHistory,
     autoRunning, autoStats, wsLog,
     getProposal, buyContract, sellContract, clearProposal,
     startAutoTrade, stopAutoTrade,
-  } = useDerivTrading(wsUrl);
+  } = useDerivTrading(apiToken);
 
   const [tab, setTab]               = useState<Tab>("trade");
   const [contractType, setContractType] = useState("CALL");
@@ -171,10 +171,17 @@ export function TradingPanel({ wsUrl, symbol, currentPrice, pipSize = 2, account
         </div>
       )}
 
+      {/* ── Auth error ── */}
+      {authError && (
+        <div className="mx-3 mt-2 text-[9px] font-mono text-red-300 bg-red-500/10 border border-red-500/20 rounded px-2 py-1.5 shrink-0">
+          ✕ Auth failed: {authError}
+        </div>
+      )}
+
       {/* ── Not authorized prompt ── */}
-      {!authOk && wsUrl && (
+      {!authOk && apiToken && !authError && (
         <div className="mx-3 mt-2 text-[9px] font-mono text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded px-2 py-1.5 shrink-0">
-          ⚠ Authorizing with Deriv… if this persists, reconnect your account.
+          ⏳ Authorizing…
         </div>
       )}
 

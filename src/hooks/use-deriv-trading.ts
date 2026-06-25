@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { DEFAULT_APP_ID, LEGACY_WS } from "./use-deriv-ticks";
 
 /* ─── Types ──────────────────────────────────────────────────────────────── */
 export interface Balance { balance: number; currency: string; loginid: string }
@@ -79,9 +80,26 @@ export interface AutoTradeConfig {
 }
 
 /* ─── Hook ───────────────────────────────────────────────────────────────── */
-export function useDerivTrading(wsUrl: string | null) {
+/**
+ * useDerivTrading
+ *
+ * Connects to the Deriv LEGACY WebSocket (ws.derivws.com) and authenticates
+ * via the `authorize` message with the account's API token.
+ *
+ * Why legacy WS?
+ * - The new OTP WS URL (api.derivws.com) uses a different message schema
+ *   that is NOT compatible with legacy proposal/buy/sell messages.
+ * - The legacy WS is fully documented, battle-tested, and supports all
+ *   trading operations with a simple `authorize` handshake.
+ *
+ * @param apiToken  The Deriv API token for the selected account
+ *                  (from fetchDerivAccounts or the authorize endpoint)
+ * @param appId     Optional app ID (defaults to env var or "1089")
+ */
+export function useDerivTrading(apiToken: string | null, appId?: string) {
   const [connected, setConnected]             = useState(false);
   const [authorized, setAuthorized]           = useState(false);
+  const [authError, setAuthError]             = useState<string | null>(null);
   const [balance, setBalance]                 = useState<Balance | null>(null);
   const [proposal, setProposal]               = useState<Proposal | null>(null);
   const [proposalLoading, setProposalLoading] = useState(false);
@@ -95,22 +113,19 @@ export function useDerivTrading(wsUrl: string | null) {
   const [autoStats, setAutoStats]             = useState({ trades: 0, won: 0, lost: 0, pnl: 0 });
   const [wsLog, setWsLog]                     = useState<string[]>([]);
 
-  const wsRef      = useRef<WebSocket | null>(null);
-  const reqIdRef   = useRef(100);
-  // Separate maps: buy/sell/portfolio = one-shot; balance = streamer
-  const buyListeners = useRef<Map<number, (d: Record<string, unknown>) => void>>(new Map());
-  const balStreamId  = useRef<number | null>(null);
-  // Proposal: always goes through here
-  const propSubRef   = useRef<string | null>(null);
-  const propResolveRef = useRef<((p: Proposal) => void) | null>(null);
-  const pingRef      = useRef<ReturnType<typeof setInterval> | null>(null);
-  const autoRef      = useRef(false);
-  const autoAmountRef = useRef(0);
-  // For settle detection in auto-trade
-  const settleResolvers = useRef<Map<number, (outcome: { won: boolean; profit: number }) => void>>(new Map());
+  const wsRef          = useRef<WebSocket | null>(null);
+  const reqIdRef       = useRef(200);
+  const oneShot        = useRef<Map<number, (d: Record<string, unknown>) => void>>(new Map());
+  const balStreamId    = useRef<number | null>(null);
+  const propSubRef     = useRef<string | null>(null);
+  const propResolve    = useRef<((p: Proposal) => void) | null>(null);
+  const pingRef        = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoRef        = useRef(false);
+  const autoAmountRef  = useRef(0);
+  const settleRef      = useRef<Map<number, (r: { won: boolean; profit: number }) => void>>(new Map());
 
   const nextId = () => ++reqIdRef.current;
-  const log = (msg: string) => setWsLog(prev => [`${new Date().toLocaleTimeString()} ${msg}`, ...prev].slice(0, 100));
+  const log = (msg: string) => setWsLog(prev => [`${new Date().toLocaleTimeString()} ${msg}`, ...prev].slice(0, 200));
 
   function rawSend(payload: Record<string, unknown>) {
     const ws = wsRef.current;
@@ -118,62 +133,70 @@ export function useDerivTrading(wsUrl: string | null) {
     ws.send(JSON.stringify(payload));
   }
 
-  // Promise-based one-shot send (for buy, sell, portfolio)
   function sendOnce<T>(payload: Record<string, unknown>, timeout = 20_000): Promise<T> {
     return new Promise((resolve, reject) => {
       const rid = nextId();
-      const full = { ...payload, req_id: rid };
       const timer = setTimeout(() => {
-        buyListeners.current.delete(rid);
-        reject(new Error(`Timeout (req_id ${rid})`));
+        oneShot.current.delete(rid);
+        reject(new Error(`Timeout req_id=${rid} msg=${payload.msg_type ?? Object.keys(payload)[0]}`));
       }, timeout);
-      buyListeners.current.set(rid, (data) => {
+      oneShot.current.set(rid, (d) => {
         clearTimeout(timer);
-        if (data.error) {
-          reject(new Error((data.error as Record<string, unknown>).message as string ?? JSON.stringify(data.error)));
-        } else {
-          resolve(data as T);
-        }
+        if (d.error) reject(new Error((d.error as Record<string, unknown>).message as string ?? "Deriv error"));
+        else resolve(d as T);
       });
-      rawSend(full);
+      rawSend({ ...payload, req_id: rid });
     });
   }
 
-  /* ── WebSocket connection ── */
+  /* ── Connect + authorize via legacy WS ── */
   useEffect(() => {
-    if (!wsUrl) return;
-    log("Connecting…");
+    if (!apiToken) return;
+
+    const wsUrl = LEGACY_WS(appId ?? (import.meta.env.VITE_DERIV_APP_ID as string | undefined) ?? DEFAULT_APP_ID);
+    log(`Connecting to legacy WS…`);
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
-    ws.onopen = () => {
+    ws.onopen = async () => {
       setConnected(true);
-      setAuthorized(true);
-      log("✓ Connected via OTP — pre-authenticated");
+      log("WS open — authorizing…");
+      try {
+        // Step 1: authorize with API token
+        const authData = await sendOnce<Record<string, unknown>>({ authorize: apiToken });
+        const acc = authData.authorize as Record<string, unknown>;
+        log(`✓ Authorized as ${acc.loginid} (${acc.currency}) [${acc.is_virtual ? "DEMO" : "REAL"}]`);
+        setAuthorized(true);
+        setAuthError(null);
 
-      // Balance subscription
-      const rid = nextId();
-      balStreamId.current = rid;
-      rawSend({ balance: 1, subscribe: 1, req_id: rid });
-      log("Subscribed to balance stream");
+        // Step 2: balance subscription
+        const balRid = nextId();
+        balStreamId.current = balRid;
+        rawSend({ balance: 1, subscribe: 1, req_id: balRid });
+        log("Subscribed to balance");
 
-      // Load open portfolio
-      sendOnce<Record<string, unknown>>({ portfolio: 1 })
-        .then((data) => {
-          const contracts = (data.portfolio as Record<string, unknown>)?.contracts as Record<string, unknown>[] | undefined;
+        // Step 3: load open portfolio
+        try {
+          const portData = await sendOnce<Record<string, unknown>>({ portfolio: 1 });
+          const contracts = (portData.portfolio as Record<string, unknown>)?.contracts as Record<string, unknown>[] | undefined;
           if (contracts?.length) {
-            log(`Found ${contracts.length} open contract(s)`);
+            log(`Found ${contracts.length} open contract(s) — subscribing…`);
             contracts.forEach(c => rawSend({ proposal_open_contract: 1, contract_id: Number(c.contract_id), subscribe: 1 }));
           }
-        })
-        .catch(() => { /* silent */ });
+        } catch { /* portfolio not critical */ }
 
-      // Keepalive
-      if (pingRef.current) clearInterval(pingRef.current);
-      pingRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) rawSend({ ping: 1 });
-      }, 25_000);
+        // Keepalive
+        if (pingRef.current) clearInterval(pingRef.current);
+        pingRef.current = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) rawSend({ ping: 1 });
+        }, 25_000);
+
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log(`✗ Auth failed: ${msg}`);
+        setAuthError(msg);
+      }
     };
 
     ws.onmessage = (ev) => {
@@ -184,23 +207,22 @@ export function useDerivTrading(wsUrl: string | null) {
 
         if (type === "ping") return;
 
-        // ── Balance stream (persistent) ──
+        // ── Balance stream ──
         if (rid && rid === balStreamId.current) {
           const b = data.balance as Record<string, unknown> | undefined;
           if (b) setBalance({ balance: Number(b.balance), currency: String(b.currency), loginid: String(b.loginid ?? "") });
           return;
         }
 
-        // ── One-shot listeners (buy, sell, portfolio, etc.) ──
-        if (rid && buyListeners.current.has(rid)) {
-          const cb = buyListeners.current.get(rid)!;
-          buyListeners.current.delete(rid);
+        // ── One-shot (buy, sell, portfolio, authorize) ──
+        if (rid && oneShot.current.has(rid)) {
+          const cb = oneShot.current.get(rid)!;
+          oneShot.current.delete(rid);
           cb(data);
           return;
         }
 
-        // ── Proposal stream — NEVER routed via req_id ──
-        // Proposals always land here regardless of req_id
+        // ── Proposal stream — no req_id routing ──
         if (type === "proposal") {
           const p = data.proposal as Record<string, unknown> | undefined;
           if (!p) return;
@@ -221,12 +243,11 @@ export function useDerivTrading(wsUrl: string | null) {
           };
           setProposal(prop);
           setProposalLoading(false);
-
-          // Notify auto-trade if it's waiting
-          if (propResolveRef.current) {
-            const resolver = propResolveRef.current;
-            propResolveRef.current = null;
-            resolver(prop);
+          // Notify auto-trade
+          if (propResolve.current) {
+            const r = propResolve.current;
+            propResolve.current = null;
+            r(prop);
           }
           return;
         }
@@ -235,7 +256,7 @@ export function useDerivTrading(wsUrl: string | null) {
         if (type === "proposal_open_contract") {
           const poc = data.proposal_open_contract as Record<string, unknown> | undefined;
           if (!poc) return;
-          const contract: OpenContract = {
+          const c: OpenContract = {
             contract_id: Number(poc.contract_id),
             contract_type: String(poc.contract_type),
             buy_price: Number(poc.buy_price),
@@ -253,38 +274,31 @@ export function useDerivTrading(wsUrl: string | null) {
             current_spot: Number(poc.current_spot ?? poc.spot ?? 0),
             sell_price: poc.sell_price ? Number(poc.sell_price) : undefined,
           };
-
-          if (contract.is_sold) {
-            setOpenContracts(prev => prev.filter(c => c.contract_id !== contract.contract_id));
-            const outcome: "won" | "lost" = contract.profit > 0 ? "won" : "lost";
+          if (c.is_sold) {
+            setOpenContracts(prev => prev.filter(x => x.contract_id !== c.contract_id));
+            const outcome: "won" | "lost" = c.profit > 0 ? "won" : "lost";
             setTradeHistory(prev => {
-              const idx = prev.findIndex(t => t.contract_id === contract.contract_id);
+              const idx = prev.findIndex(t => t.contract_id === c.contract_id);
               if (idx >= 0) {
-                const updated = [...prev];
-                updated[idx] = { ...updated[idx], outcome, sell_price: contract.sell_price, profit: contract.profit };
-                return updated;
+                const u = [...prev];
+                u[idx] = { ...u[idx], outcome, sell_price: c.sell_price, profit: c.profit };
+                return u;
               }
               return prev;
             });
-            // Resolve settle promise for auto-trade
-            const resolver = settleResolvers.current.get(contract.contract_id);
-            if (resolver) {
-              settleResolvers.current.delete(contract.contract_id);
-              resolver({ won: contract.profit > 0, profit: contract.profit });
-            }
+            const sr = settleRef.current.get(c.contract_id);
+            if (sr) { settleRef.current.delete(c.contract_id); sr({ won: c.profit > 0, profit: c.profit }); }
             // Martingale
             if (autoRef.current && autoConfig?.martingale) {
-              if (contract.profit > 0) {
-                autoAmountRef.current = autoConfig.amount;
-              } else {
-                autoAmountRef.current = autoAmountRef.current * (autoConfig.martingale_multiplier ?? 2);
-              }
+              autoAmountRef.current = c.profit > 0
+                ? autoConfig.amount
+                : autoAmountRef.current * (autoConfig.martingale_multiplier ?? 2);
             }
           } else {
             setOpenContracts(prev => {
-              const idx = prev.findIndex(c => c.contract_id === contract.contract_id);
-              if (idx >= 0) { const n = [...prev]; n[idx] = contract; return n; }
-              return [...prev, contract];
+              const idx = prev.findIndex(x => x.contract_id === c.contract_id);
+              if (idx >= 0) { const n = [...prev]; n[idx] = c; return n; }
+              return [...prev, c];
             });
           }
           return;
@@ -293,44 +307,43 @@ export function useDerivTrading(wsUrl: string | null) {
         // ── Balance one-shot refresh ──
         if (type === "balance" && rid !== balStreamId.current) {
           const b = data.balance as Record<string, unknown> | undefined;
-          if (b) setBalance({ balance: Number(b.balance), currency: String(b.currency), loginid: String(b.loginid ?? "") });
+          if (b) setBalance(prev => ({ ...prev!, balance: Number(b.balance), currency: String(b.currency) }));
           return;
         }
 
-      } catch (e) {
-        console.error("[TradingWS]", e);
-      }
+      } catch (e) { console.error("[TradingWS]", e); }
     };
 
-    ws.onerror = () => { setError("WebSocket error"); };
+    ws.onerror = () => setError("WebSocket error — check your connection");
     ws.onclose = (e) => {
       if (pingRef.current) clearInterval(pingRef.current);
       setConnected(false);
       setAuthorized(false);
-      log(`Disconnected (${e.code})`);
+      log(`Disconnected (code ${e.code})`);
     };
 
     return () => {
       autoRef.current = false;
       if (pingRef.current) clearInterval(pingRef.current);
       ws.close();
+      wsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsUrl]);
+  }, [apiToken, appId]);
 
   /* ── Get proposal (streaming) ── */
   const getProposal = useCallback(async (params: ProposalParams) => {
-    if (!authorized) { setError("Not authorized — connect your Deriv account first"); return; }
-    // Cancel old sub
+    if (!authorized) { setError("Not authorized — reconnect your Deriv account"); return; }
     if (propSubRef.current) {
       try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
       propSubRef.current = null;
     }
-    propResolveRef.current = null;
+    propResolve.current = null;
     setProposal(null);
     setError(null);
     setProposalLoading(true);
 
+    // IMPORTANT: no req_id — proposals route by msg_type not req_id
     const payload: Record<string, unknown> = {
       proposal: 1,
       amount: params.amount,
@@ -341,13 +354,12 @@ export function useDerivTrading(wsUrl: string | null) {
       duration_unit: params.duration_unit,
       symbol: params.symbol,
       subscribe: 1,
-      // NOTE: no req_id on proposals — so they always hit the proposal branch in onmessage
     };
     if (params.barrier !== undefined && params.barrier !== "") payload.barrier = params.barrier;
 
     try {
       rawSend(payload);
-      log(`Quote requested: ${params.contract_type} ${params.symbol} ×${params.amount}`);
+      log(`Quote: ${params.contract_type} ${params.symbol} ×${params.amount} ${params.currency} ${params.duration}${params.duration_unit}`);
     } catch (e) {
       setError(String(e));
       setProposalLoading(false);
@@ -357,12 +369,9 @@ export function useDerivTrading(wsUrl: string | null) {
   /* ── Buy ── */
   const buyContract = useCallback(async (proposalId: string, price: number): Promise<TradeResult | null> => {
     if (!authorized) { setError("Not authorized"); return null; }
-    if (!proposalId) { setError("No proposal ID — get a quote first"); return null; }
-
     setBuying(true);
     setError(null);
     log(`Buying ${proposalId} @ ${price}…`);
-
     try {
       const data = await sendOnce<Record<string, unknown>>({ buy: proposalId, price });
       const b = data.buy as Record<string, unknown>;
@@ -375,14 +384,12 @@ export function useDerivTrading(wsUrl: string | null) {
         transaction_id: Number(b.transaction_id),
         start_time: Number(b.start_time),
       };
-      log(`✓ Bought #${result.contract_id} · Paid ${result.buy_price} · Max payout ${result.payout}`);
+      log(`✓ Bought #${result.contract_id} · Paid ${result.buy_price} · Payout ${result.payout}`);
       setLastTrade(result);
-      setTradeHistory(prev => [result, ...prev].slice(0, 100));
+      setTradeHistory(prev => [result, ...prev].slice(0, 200));
       setBalance(prev => prev ? { ...prev, balance: result.balance_after } : prev);
       setProposal(null);
-      // Subscribe to live updates
       try { rawSend({ proposal_open_contract: 1, contract_id: result.contract_id, subscribe: 1 }); } catch { /* ok */ }
-      // Forget proposal stream
       if (propSubRef.current) {
         try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
         propSubRef.current = null;
@@ -400,15 +407,13 @@ export function useDerivTrading(wsUrl: string | null) {
 
   /* ── Sell ── */
   const sellContract = useCallback(async (contractId: number) => {
-    if (!authorized) { setError("Not authorized"); return; }
+    if (!authorized) return;
     log(`Selling #${contractId}…`);
     try {
       await sendOnce<Record<string, unknown>>({ sell: contractId, price: 0 });
       log(`✓ Sold #${contractId}`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      log(`✗ Sell failed: ${msg}`);
-      setError(msg);
+      setError(e instanceof Error ? e.message : String(e));
     }
   }, [authorized]);
 
@@ -418,7 +423,7 @@ export function useDerivTrading(wsUrl: string | null) {
       try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
       propSubRef.current = null;
     }
-    propResolveRef.current = null;
+    propResolve.current = null;
     setProposal(null);
     setProposalLoading(false);
   }, []);
@@ -427,79 +432,72 @@ export function useDerivTrading(wsUrl: string | null) {
   const startAutoTrade = useCallback(async (config: AutoTradeConfig) => {
     if (!authorized) { setError("Not authorized"); return; }
     if (autoRef.current) return;
-
     autoRef.current = true;
     autoAmountRef.current = config.amount;
     setAutoRunning(true);
     setAutoConfig(config);
     setAutoStats({ trades: 0, won: 0, lost: 0, pnl: 0 });
-    log(`▶ Auto-trade started: ${config.contract_type} on ${config.symbol}`);
+    log(`▶ Auto-trade: ${config.contract_type} ${config.symbol} stake=${config.amount} ${config.currency}`);
 
     let trades = 0, won = 0, lost = 0, pnl = 0;
 
     while (autoRef.current) {
-      // Stop conditions
       if (config.max_trades && trades >= config.max_trades) { log(`Max trades (${config.max_trades}) reached`); break; }
-      const curBal = balance?.balance ?? 0;
-      if (config.stop_loss && curBal <= config.stop_loss) { log(`Stop loss hit (${curBal} ≤ ${config.stop_loss})`); break; }
-      if (config.take_profit && curBal >= config.take_profit) { log(`Take profit hit (${curBal} ≥ ${config.take_profit})`); break; }
+      if (config.stop_loss && (balance?.balance ?? 0) <= config.stop_loss) { log(`Stop loss hit`); break; }
+      if (config.take_profit && (balance?.balance ?? 0) >= config.take_profit) { log(`Take profit hit`); break; }
 
       const stake = autoAmountRef.current;
 
       try {
-        // Cancel any existing proposal
+        // Cancel old proposal
         if (propSubRef.current) {
           try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
           propSubRef.current = null;
         }
-        propResolveRef.current = null;
+        propResolve.current = null;
         setProposal(null);
         setProposalLoading(true);
 
-        // Request proposal — no req_id so it goes to proposal branch
-        const propPayload: Record<string, unknown> = {
-          proposal: 1,
-          amount: stake,
-          basis: config.basis,
-          contract_type: config.contract_type,
-          currency: config.currency,
-          duration: config.duration,
-          duration_unit: config.duration_unit,
-          symbol: config.symbol,
-          subscribe: 1,
-        };
-        if (config.barrier) propPayload.barrier = config.barrier;
-
-        // Wait for first proposal tick via propResolveRef
+        // Get proposal — wait via propResolve, not req_id
         const prop = await new Promise<Proposal>((resolve, reject) => {
           const timer = setTimeout(() => {
-            propResolveRef.current = null;
-            reject(new Error("Proposal timeout — no response in 15s. Check symbol or connection."));
+            propResolve.current = null;
+            reject(new Error(
+              `Proposal timeout (15s). Symbol: ${config.symbol} | Type: ${config.contract_type}\n` +
+              "Possible causes: symbol not tradeable, duration too short, or connection issue."
+            ));
           }, 15_000);
-          propResolveRef.current = (p) => { clearTimeout(timer); resolve(p); };
-          try { rawSend(propPayload); } catch (e) { clearTimeout(timer); propResolveRef.current = null; reject(e); }
+          propResolve.current = (p) => { clearTimeout(timer); resolve(p); };
+
+          const payload: Record<string, unknown> = {
+            proposal: 1,
+            amount: stake,
+            basis: config.basis,
+            contract_type: config.contract_type,
+            currency: config.currency,
+            duration: config.duration,
+            duration_unit: config.duration_unit,
+            symbol: config.symbol,
+            subscribe: 1,
+          };
+          if (config.barrier) payload.barrier = config.barrier;
+          try { rawSend(payload); }
+          catch (e) { clearTimeout(timer); propResolve.current = null; reject(e); }
         });
 
         if (!autoRef.current) break;
-
-        // Execute buy
         const result = await buyContract(prop.id, prop.ask_price);
-        if (!result) { log("Buy failed — stopping auto-trade"); break; }
+        if (!result) { log("Buy failed — retrying in 3s…"); await new Promise(r => setTimeout(r, 3_000)); continue; }
 
         trades++;
 
-        // Wait for contract to settle
+        // Wait for settle
         const settled = await new Promise<{ won: boolean; profit: number }>((resolve) => {
-          const safetyMs = (config.duration_unit === "t"
-            ? config.duration * 2500
-            : config.duration * 1200
-          ) + 15_000;
-
-          settleResolvers.current.set(result.contract_id, resolve);
-          // Safety fallback
+          const safetyMs = (config.duration_unit === "t" ? config.duration * 2500 : config.duration * 1500) + 15_000;
+          settleRef.current.set(result.contract_id, resolve);
           setTimeout(() => {
-            if (settleResolvers.current.has(result.contract_id)) {
-              settleResolvers.current.delete(result.contract_id);
+            if (settleRef.current.has(result.contract_id)) {
+              settleRef.current.delete(result.contract_id);
               resolve({ won: false, profit: 0 });
             }
           }, safetyMs);
@@ -507,19 +505,17 @@ export function useDerivTrading(wsUrl: string | null) {
 
         if (settled.won) { won++; pnl += Math.abs(settled.profit); }
         else { lost++; pnl -= stake; }
-
         setAutoStats({ trades, won, lost, pnl });
-        log(`Trade #${trades}: ${settled.won ? "✓ WON" : "✗ LOST"} | P/L ${pnl.toFixed(2)} ${config.currency}`);
+        log(`#${trades}: ${settled.won ? "✓ WON" : "✗ LOST"} | Balance P/L ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} ${config.currency}`);
 
         if (!autoRef.current) break;
         await new Promise(r => setTimeout(r, config.delay_between_ms ?? 500));
 
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        log(`✗ Auto-trade error: ${msg}`);
+        log(`✗ Error: ${msg}`);
         setError(msg);
         await new Promise(r => setTimeout(r, 3_000));
-        // Don't break — retry unless stopped
         if (!autoRef.current) break;
       }
     }
@@ -527,17 +523,17 @@ export function useDerivTrading(wsUrl: string | null) {
     autoRef.current = false;
     setAutoRunning(false);
     setAutoConfig(null);
-    log(`■ Stopped. ${trades} trades | ${won}W ${lost}L | P/L ${pnl.toFixed(2)}`);
+    log(`■ Stopped. ${trades} trades | ${won}W/${lost}L | P/L ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
   }, [authorized, balance, buyContract]);
 
   const stopAutoTrade = useCallback(() => {
     autoRef.current = false;
     setAutoRunning(false);
-    log("■ Auto-trade stopped by user");
+    log("■ Stopped by user");
   }, []);
 
   return {
-    connected, authorized, balance, proposal, proposalLoading,
+    connected, authorized, authError, balance, proposal, proposalLoading,
     openContracts, buying, error, lastTrade, tradeHistory,
     autoRunning, autoConfig, autoStats, wsLog,
     getProposal, buyContract, sellContract, clearProposal,
