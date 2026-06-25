@@ -4,6 +4,7 @@ import {
   buildDerivAuthURL,
   exchangeCodeForToken,
   fetchDerivAccounts,
+  fetchApiToken,
   type DerivAccountRaw,
 } from "./use-deriv-ticks";
 
@@ -13,14 +14,14 @@ export interface DerivAccount {
   currency: string;
   account_type: "demo" | "real";
   status: string;
-  api_token?: string;  // Deriv API token — used for legacy WS authorize
+  api_token?: string;  // WS-compatible Deriv API token (short, e.g. "a1-xxxx")
 }
 
 export interface DerivAuthState {
-  accessToken: string | null;         // OAuth2 Bearer token (REST API calls)
+  accessToken: string | null;       // OAuth2 Bearer — for REST calls only
   accounts: DerivAccount[];
   activeAccount: DerivAccount | null;
-  activeApiToken: string | null;      // Deriv API token for the active account (WS authorize)
+  activeApiToken: string | null;    // WS-compatible token for legacy WS authorize
   loading: boolean;
   error: string | null;
 }
@@ -31,19 +32,17 @@ const REDIRECT  = typeof window !== "undefined"
   ? `${window.location.origin}/callback`
   : "http://localhost:3000/callback";
 
-const STORAGE_KEY = "deriv_pulse_auth_v2";
+const STORAGE_KEY = "deriv_pulse_auth_v3";
 
-function persist(data: { token: string; accounts: DerivAccount[]; activeAccountId: string }) {
-  try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch { /* noop */ }
+function persist(d: { token: string; accounts: DerivAccount[]; activeAccountId: string }) {
+  try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch { /* noop */ }
 }
 function restore(): { token: string; accounts: DerivAccount[]; activeAccountId: string } | null {
-  try {
-    const raw = sessionStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch { return null; }
+  try { const r = sessionStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : null; }
+  catch { return null; }
 }
 
-function rawToDerivAccount(r: DerivAccountRaw): DerivAccount {
+function toAccount(r: DerivAccountRaw): DerivAccount {
   return {
     account_id: r.account_id,
     balance: r.balance,
@@ -56,12 +55,8 @@ function rawToDerivAccount(r: DerivAccountRaw): DerivAccount {
 
 export function useDerivOAuth() {
   const [state, setState] = useState<DerivAuthState>({
-    accessToken: null,
-    accounts: [],
-    activeAccount: null,
-    activeApiToken: null,
-    loading: false,
-    error: null,
+    accessToken: null, accounts: [], activeAccount: null,
+    activeApiToken: null, loading: false, error: null,
   });
 
   const initRef = useRef(false);
@@ -75,19 +70,16 @@ export function useDerivOAuth() {
     const { token, accounts, activeAccountId } = saved;
     const active = accounts.find(a => a.account_id === activeAccountId) ?? accounts[0] ?? null;
     setState({
-      accessToken: token,
-      accounts,
-      activeAccount: active,
+      accessToken: token, accounts, activeAccount: active,
       activeApiToken: active?.api_token ?? null,
-      loading: false,
-      error: null,
+      loading: false, error: null,
     });
   }, []);
 
   /* ── Login ── */
   const login = useCallback(async (signup = false) => {
     if (!CLIENT_ID) {
-      setState(prev => ({ ...prev, error: "Set VITE_DERIV_CLIENT_ID in .env to enable Deriv login" }));
+      setState(prev => ({ ...prev, error: "Set VITE_DERIV_CLIENT_ID in .env" }));
       return;
     }
     setState(prev => ({ ...prev, loading: true, error: null }));
@@ -95,8 +87,10 @@ export function useDerivOAuth() {
       const { codeVerifier, codeChallenge, state: oauthState } = await generatePKCE();
       sessionStorage.setItem("pkce_cv", codeVerifier);
       sessionStorage.setItem("oauth_state", oauthState);
-      const url = buildDerivAuthURL({ clientId: CLIENT_ID, redirectUri: REDIRECT, codeChallenge, state: oauthState, signup });
-      window.location.href = url;
+      window.location.href = buildDerivAuthURL({
+        clientId: CLIENT_ID, redirectUri: REDIRECT,
+        codeChallenge, state: oauthState, signup,
+      });
     } catch (e) {
       setState(prev => ({ ...prev, loading: false, error: String(e) }));
     }
@@ -105,69 +99,91 @@ export function useDerivOAuth() {
   /* ── OAuth callback ── */
   const handleCallback = useCallback(async (code: string, returnedState: string) => {
     if (!CLIENT_ID) return;
-    const storedState  = sessionStorage.getItem("oauth_state");
+    if (returnedState !== sessionStorage.getItem("oauth_state")) {
+      setState(prev => ({ ...prev, error: "OAuth state mismatch" })); return;
+    }
     const codeVerifier = sessionStorage.getItem("pkce_cv");
-    if (returnedState !== storedState) {
-      setState(prev => ({ ...prev, error: "OAuth state mismatch — possible CSRF" }));
-      return;
-    }
     if (!codeVerifier) {
-      setState(prev => ({ ...prev, error: "PKCE code verifier missing" }));
-      return;
+      setState(prev => ({ ...prev, error: "PKCE verifier missing" })); return;
     }
+
     setState(prev => ({ ...prev, loading: true, error: null }));
     try {
-      const { access_token } = await exchangeCodeForToken({ clientId: CLIENT_ID, code, codeVerifier, redirectUri: REDIRECT });
-      const rawAccounts = await fetchDerivAccounts(access_token, APP_ID);
-      const accounts: DerivAccount[] = rawAccounts.map(rawToDerivAccount);
-
-      // Prefer demo for safety
-      const active = accounts.find(a => a.account_type === "demo") ?? accounts[0] ?? null;
-      persist({ token: access_token, accounts, activeAccountId: active?.account_id ?? "" });
-
-      setState({
-        accessToken: access_token,
-        accounts,
-        activeAccount: active,
-        activeApiToken: active?.api_token ?? null,
-        loading: false,
-        error: null,
+      // 1. Exchange code for Bearer token
+      const { access_token } = await exchangeCodeForToken({
+        clientId: CLIENT_ID, code, codeVerifier, redirectUri: REDIRECT,
       });
 
+      // 2. Fetch account list
+      const rawAccounts = await fetchDerivAccounts(access_token, APP_ID);
+      const accounts: DerivAccount[] = rawAccounts.map(toAccount);
+
+      // 3. Prefer demo account for safety
+      const active = accounts.find(a => a.account_type === "demo") ?? accounts[0] ?? null;
+
+      // 4. Fetch WS-compatible API token for the active account
+      let apiToken: string | null = active?.api_token ?? null;
+      if (!apiToken && active) {
+        try {
+          apiToken = await fetchApiToken(active.account_id, access_token, APP_ID);
+          // Store it on the account object
+          const idx = accounts.findIndex(a => a.account_id === active.account_id);
+          if (idx >= 0) accounts[idx] = { ...accounts[idx], api_token: apiToken };
+        } catch (e) {
+          console.warn("[DerivOAuth] fetchApiToken failed:", e);
+          // Non-fatal — user will see auth error in trading panel
+        }
+      }
+
+      persist({ token: access_token, accounts, activeAccountId: active?.account_id ?? "" });
       sessionStorage.removeItem("pkce_cv");
       sessionStorage.removeItem("oauth_state");
+
+      setState({
+        accessToken: access_token, accounts, activeAccount: active,
+        activeApiToken: apiToken,
+        loading: false, error: null,
+      });
     } catch (e) {
       setState(prev => ({ ...prev, loading: false, error: String(e) }));
     }
   }, []);
 
   /* ── Switch account ── */
-  const switchAccount = useCallback((accountId: string) => {
+  const switchAccount = useCallback(async (accountId: string) => {
     setState(prev => {
       const account = prev.accounts.find(a => a.account_id === accountId);
       if (!account) return prev;
       const saved = restore();
       if (saved) persist({ ...saved, activeAccountId: accountId });
-      return { ...prev, activeAccount: account, activeApiToken: account.api_token ?? null };
+      // If we already have an api_token for this account, use it immediately
+      if (account.api_token) {
+        return { ...prev, activeAccount: account, activeApiToken: account.api_token };
+      }
+      // Otherwise fetch it async (handled below)
+      return { ...prev, activeAccount: account, activeApiToken: null, loading: true };
+    });
+
+    // Async fetch for accounts without a cached token
+    setState(prev => {
+      const account = prev.accounts.find(a => a.account_id === accountId);
+      if (!account || account.api_token) return prev;
+      // Fire async fetch
+      if (prev.accessToken) {
+        fetchApiToken(accountId, prev.accessToken, APP_ID)
+          .then(token => {
+            setState(s => ({
+              ...s,
+              activeApiToken: token,
+              loading: false,
+              accounts: s.accounts.map(a => a.account_id === accountId ? { ...a, api_token: token } : a),
+            }));
+          })
+          .catch(() => setState(s => ({ ...s, loading: false })));
+      }
+      return prev;
     });
   }, []);
-
-  /* ── Refresh balances ── */
-  const refreshBalance = useCallback(async () => {
-    const { accessToken, activeAccount } = state;
-    if (!accessToken) return;
-    try {
-      const raw = await fetchDerivAccounts(accessToken, APP_ID);
-      const accounts: DerivAccount[] = raw.map(rawToDerivAccount);
-      setState(prev => ({
-        ...prev,
-        accounts,
-        activeAccount: accounts.find(a => a.account_id === activeAccount?.account_id) ?? prev.activeAccount,
-      }));
-      const saved = restore();
-      if (saved) persist({ ...saved, accounts });
-    } catch { /* silent */ }
-  }, [state]);
 
   /* ── Logout ── */
   const logout = useCallback(() => {
@@ -179,12 +195,8 @@ export function useDerivOAuth() {
     ...state,
     isAuthenticated: !!state.accessToken,
     hasClientId: !!CLIENT_ID,
-    login,
-    logout,
-    handleCallback,
-    switchAccount,
-    refreshBalance,
-    // Backwards compat — callers that used authenticatedWsUrl
-    authenticatedWsUrl: state.activeApiToken ? "legacy_ws_with_token" : null,
+    // Backwards compat sentinel — non-null means "we have a token, open trading panel"
+    authenticatedWsUrl: state.activeApiToken ? "ready" : null,
+    login, logout, handleCallback, switchAccount,
   };
 }

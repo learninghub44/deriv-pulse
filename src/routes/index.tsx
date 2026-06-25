@@ -302,7 +302,6 @@ function Index() {
                   {derivOAuth.isAuthenticated ? (
                     <TradingPanel
                       apiToken={derivOAuth.activeApiToken}
-                      accessToken={derivOAuth.accessToken}
                       symbol={symbol}
                       currentPrice={ticks[ticks.length - 1]?.quote}
                       pipSize={ticks[ticks.length - 1]?.pip_size ?? meta.pip ? Math.round(-Math.log10(meta.pip)) : 2}

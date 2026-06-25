@@ -96,7 +96,7 @@ export interface AutoTradeConfig {
  *                  (from fetchDerivAccounts or the authorize endpoint)
  * @param appId     Optional app ID (defaults to env var or "1089")
  */
-export function useDerivTrading(apiToken: string | null, appId?: string, fallbackOAuthToken?: string | null) {
+export function useDerivTrading(apiToken: string | null, appId?: string) {
   const [connected, setConnected]             = useState(false);
   const [authorized, setAuthorized]           = useState(false);
   const [authError, setAuthError]             = useState<string | null>(null);
@@ -151,10 +151,10 @@ export function useDerivTrading(apiToken: string | null, appId?: string, fallbac
 
   /* ── Connect + authorize via legacy WS ── */
   useEffect(() => {
-    if (!apiToken && !fallbackOAuthToken) return;
+    if (!apiToken) return;
 
     const wsUrl = LEGACY_WS(appId ?? (import.meta.env.VITE_DERIV_APP_ID as string | undefined) ?? DEFAULT_APP_ID);
-    log(`Connecting to legacy WS…`);
+    log(`Connecting… (token: ${apiToken.slice(0, 8)}…)`);
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -162,7 +162,7 @@ export function useDerivTrading(apiToken: string | null, appId?: string, fallbac
     ws.onopen = async () => {
       setConnected(true);
       log("WS open — authorizing…");
-      const tokenToUse = apiToken ?? fallbackOAuthToken!;
+      const tokenToUse = apiToken;
       try {
         // Step 1: authorize
         const authData = await sendOnce<Record<string, unknown>>({ authorize: tokenToUse });
@@ -330,7 +330,7 @@ export function useDerivTrading(apiToken: string | null, appId?: string, fallbac
       wsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiToken, fallbackOAuthToken, appId]);
+  }, [apiToken, appId]);
 
   /* ── Get proposal (streaming) ── */
   const getProposal = useCallback(async (params: ProposalParams) => {

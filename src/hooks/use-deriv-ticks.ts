@@ -4,10 +4,9 @@ export type Tick = { quote: number; epoch: number; pip_size: number };
 export type Status = "idle" | "connecting" | "open" | "closed" | "error" | "reconnecting";
 
 /* ─── API constants ──────────────────────────────────────────────────────── */
-// Public tick stream — legacy WS (new public endpoint is unreliable for proposals)
-export const LEGACY_WS  = (appId: string) => `wss://ws.derivws.com/websockets/v3?app_id=${appId}`;
-export const DEFAULT_APP_ID = "1089";  // public read-only app_id for tick data
-const REST_BASE = "https://api.derivws.com";
+export const LEGACY_WS     = (appId: string) => `wss://ws.derivws.com/websockets/v3?app_id=${appId}`;
+export const DEFAULT_APP_ID = "1089";
+const REST_BASE             = "https://api.derivws.com";
 
 const BUFFER         = 1000;
 const PING_INTERVAL  = 25_000;
@@ -73,30 +72,15 @@ export async function exchangeCodeForToken(opts: {
   return res.json();
 }
 
-/* ─── REST: get OTP WebSocket URL ───────────────────────────────────────── */
-export async function getAuthenticatedWsUrl(accountId: string, accessToken: string, appId?: string): Promise<string> {
-  const res = await fetch(`${REST_BASE}/trading/v1/options/accounts/${accountId}/otp`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      ...(appId ? { "Deriv-App-ID": appId } : {}),
-    },
-  });
-  if (!res.ok) throw new Error(`OTP request failed: ${res.status}`);
-  const json = await res.json();
-  // New API returns { data: { url: "wss://..." } } or { url: "wss://..." }
-  return (json.data?.url ?? json.url) as string;
-}
-
-/* ─── REST: list accounts — also extracts api_token per account ──────────── */
+/* ─── REST: list accounts ─────────────────────────────────────────────────── */
 export interface DerivAccountRaw {
   account_id: string;
   balance: number;
   currency: string;
   account_type: string;
   status: string;
-  api_token?: string;   // returned by some Deriv OAuth flows
-  token?: string;        // alternate field name
+  api_token?: string;
+  token?: string;
 }
 
 export async function fetchDerivAccounts(accessToken: string, appId?: string): Promise<DerivAccountRaw[]> {
@@ -107,11 +91,61 @@ export async function fetchDerivAccounts(accessToken: string, appId?: string): P
     },
   });
   if (!res.ok) throw new Error(`Accounts fetch failed: ${res.status}`);
-  const { data } = await res.json();
-  return data as DerivAccountRaw[];
+  const json = await res.json();
+  // Response may be { data: [...] } or directly [...]
+  return (json.data ?? json) as DerivAccountRaw[];
 }
 
-/* ─── Build legacy WS URL for trading (pre-authenticated via authorize msg) ─ */
+/* ─── Get Deriv API token for an account via legacy WS authorize flow ──────
+ *
+ * The Deriv legacy WebSocket (ws.derivws.com) accepts the OAuth access_token
+ * in the `authorize` call via a special REST endpoint that exchanges it for
+ * a WS-compatible session. But the simplest reliable method is:
+ *
+ * POST /trading/v1/options/accounts/{id}/token
+ * → returns { data: { token: "a1-xxxx" } }  (short-lived API token)
+ *
+ * This token works with {authorize: token} on the legacy WS.
+ * ─────────────────────────────────────────────────────────────────────────── */
+export async function fetchApiToken(accountId: string, accessToken: string, appId?: string): Promise<string> {
+  // Try dedicated token endpoint first
+  const res = await fetch(`${REST_BASE}/trading/v1/options/accounts/${accountId}/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      ...(appId ? { "Deriv-App-ID": appId } : {}),
+    },
+  });
+  if (res.ok) {
+    const json = await res.json();
+    const token = json.data?.token ?? json.data?.api_token ?? json.token ?? json.api_token;
+    if (token) return token as string;
+  }
+
+  // Fallback: try OTP endpoint — some Deriv setups return a token in the URL
+  const otpRes = await fetch(`${REST_BASE}/trading/v1/options/accounts/${accountId}/otp`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(appId ? { "Deriv-App-ID": appId } : {}),
+    },
+  });
+  if (otpRes.ok) {
+    const json = await otpRes.json();
+    // OTP URL format: wss://...?token=a1-xxxx  — extract token param if present
+    const url: string = json.data?.url ?? json.url ?? "";
+    const tokenMatch = url.match(/[?&]token=([^&]+)/);
+    if (tokenMatch) return tokenMatch[1];
+    // Some responses include it directly
+    const direct = json.data?.api_token ?? json.data?.token ?? json.api_token ?? json.token;
+    if (direct) return direct as string;
+  }
+
+  throw new Error("Could not obtain Deriv API token — check app permissions");
+}
+
+/* ─── Build legacy WS URL ────────────────────────────────────────────────── */
 export function buildTradingWsUrl(appId?: string): string {
   return LEGACY_WS(appId ?? DEFAULT_APP_ID);
 }
@@ -121,69 +155,53 @@ export async function fetchActiveSymbols(): Promise<
   Array<{ symbol: string; display_name: string; market: string; submarket: string; pip: number }>
 > {
   return new Promise((resolve, reject) => {
-    let ws: WebSocket;
     let resolved = false;
-
-    const tryConnect = (url: string, appId: string) => {
-      ws = new WebSocket(url);
-      const timeout = setTimeout(() => {
-        ws.close();
-        if (!resolved && appId === DEFAULT_APP_ID) {
-          tryConnect(LEGACY_WS("36544"), "36544");
-        } else if (!resolved) {
-          reject(new Error("timeout"));
-        }
-      }, 8000);
-
-      ws.onopen = () => {
-        ws.send(JSON.stringify({ active_symbols: "brief", product_type: "basic" }));
-      };
-
+    const tryUrl = (url: string) => {
+      const ws = new WebSocket(url);
+      const t = setTimeout(() => { ws.close(); if (!resolved) reject(new Error("timeout")); }, 8000);
+      ws.onopen = () => ws.send(JSON.stringify({ active_symbols: "brief", product_type: "basic" }));
       ws.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data as string);
           if (data.msg_type === "active_symbols") {
-            clearTimeout(timeout);
-            resolved = true;
-            ws.close();
-            const raw = data.active_symbols as Array<Record<string, unknown>>;
-            resolve(
-              raw.map((s) => ({
-                symbol: String(s.underlying_symbol ?? s.symbol ?? ""),
-                display_name: String(s.underlying_symbol_name ?? s.display_name ?? ""),
-                market: String(s.market ?? ""),
-                submarket: String(s.submarket ?? ""),
-                pip: Number(s.pip ?? 0.01),
-              }))
-            );
+            clearTimeout(t); resolved = true; ws.close();
+            resolve((data.active_symbols as Array<Record<string, unknown>>).map(s => ({
+              symbol: String(s.underlying_symbol ?? s.symbol ?? ""),
+              display_name: String(s.underlying_symbol_name ?? s.display_name ?? ""),
+              market: String(s.market ?? ""),
+              submarket: String(s.submarket ?? ""),
+              pip: Number(s.pip ?? 0.01),
+            })));
           }
-        } catch { /* ignore parse errors */ }
+        } catch { /* ignore */ }
       };
-      ws.onerror = () => { clearTimeout(timeout); };
+      ws.onerror = () => clearTimeout(t);
     };
-
-    tryConnect(LEGACY_WS(DEFAULT_APP_ID), DEFAULT_APP_ID);
+    tryUrl(LEGACY_WS(DEFAULT_APP_ID));
   });
 }
 
+/* ─── Utility ────────────────────────────────────────────────────────────── */
+export function lastDigit(quote: number, pipSize: number): number {
+  const decimals = Math.round(-Math.log10(pipSize));
+  const str = quote.toFixed(decimals);
+  return Number(str[str.length - 1]);
+}
+
 /* ─── Hook ───────────────────────────────────────────────────────────────── */
-export function useDerivTicks(symbol: string, tradingWsUrl?: string | null) {
+export function useDerivTicks(symbol: string) {
   const [ticks, setTicks]   = useState<Tick[]>([]);
   const [status, setStatus] = useState<Status>("idle");
 
   const wsRef        = useRef<WebSocket | null>(null);
   const reconnectRef = useRef(0);
   const pingRef      = useRef<ReturnType<typeof setInterval> | null>(null);
-  const subRef       = useRef<string | null>(null);
   const mountedRef   = useRef(true);
 
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
-
-    // Use legacy WS for public tick data — reliable and well-tested
-    const url = LEGACY_WS(DEFAULT_APP_ID);
     setStatus("connecting");
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(LEGACY_WS(DEFAULT_APP_ID));
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -202,22 +220,17 @@ export function useDerivTicks(symbol: string, tradingWsUrl?: string | null) {
       try {
         const data = JSON.parse(ev.data as string);
         const pip = data.pip_size ?? data.tick?.pip_size ?? 0.01;
-
         if (data.msg_type === "history") {
           const prices = (data.history?.prices as number[]) ?? [];
           const times  = (data.history?.times  as number[]) ?? [];
-          const hist: Tick[] = prices.map((q, i) => ({ quote: q, epoch: times[i] ?? 0, pip_size: pip }));
-          setTicks(hist);
-          subRef.current = data.subscription?.id ?? null;
+          setTicks(prices.map((q, i) => ({ quote: q, epoch: times[i] ?? 0, pip_size: pip })));
         }
         if (data.msg_type === "tick") {
           const t = data.tick as Record<string, unknown>;
-          if (t) {
-            setTicks(prev => {
-              const next = [...prev, { quote: Number(t.quote), epoch: Number(t.epoch), pip_size: pip }];
-              return next.length > BUFFER ? next.slice(-BUFFER) : next;
-            });
-          }
+          if (t) setTicks(prev => {
+            const next = [...prev, { quote: Number(t.quote), epoch: Number(t.epoch), pip_size: pip }];
+            return next.length > BUFFER ? next.slice(-BUFFER) : next;
+          });
         }
       } catch { /* ignore */ }
     };
@@ -227,14 +240,11 @@ export function useDerivTicks(symbol: string, tradingWsUrl?: string | null) {
       if (!mountedRef.current) return;
       setStatus("reconnecting");
       const attempt = reconnectRef.current++;
-      if (attempt < MAX_RECONNECTS) {
-        setTimeout(connect, backoff(attempt));
-      } else {
-        setStatus("error");
-      }
+      if (attempt < MAX_RECONNECTS) setTimeout(connect, backoff(attempt));
+      else setStatus("error");
     };
 
-    ws.onerror = () => { setStatus("error"); };
+    ws.onerror = () => setStatus("error");
   }, [symbol]);
 
   useEffect(() => {
@@ -251,11 +261,4 @@ export function useDerivTicks(symbol: string, tradingWsUrl?: string | null) {
   }, [connect]);
 
   return { ticks, status };
-}
-
-/* ─── Utility: extract last digit from a tick quote ─────────────────────── */
-export function lastDigit(quote: number, pipSize: number): number {
-  const decimals = Math.round(-Math.log10(pipSize));
-  const str = quote.toFixed(decimals);
-  return Number(str[str.length - 1]);
 }
