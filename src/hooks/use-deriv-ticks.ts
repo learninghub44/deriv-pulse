@@ -43,7 +43,7 @@ export function buildDerivAuthURL(opts: {
     response_type: "code",
     client_id: opts.clientId,
     redirect_uri: opts.redirectUri,
-    scope: opts.scope ?? "trade read",
+    scope: opts.scope ?? "trade",
     state: opts.state,
     code_challenge: opts.codeChallenge,
     code_challenge_method: "S256",
