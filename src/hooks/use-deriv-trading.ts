@@ -96,7 +96,7 @@ export interface AutoTradeConfig {
  *                  (from fetchDerivAccounts or the authorize endpoint)
  * @param appId     Optional app ID (defaults to env var or "1089")
  */
-export function useDerivTrading(apiToken: string | null, appId?: string) {
+export function useDerivTrading(apiToken: string | null, appId?: string, fallbackOAuthToken?: string | null) {
   const [connected, setConnected]             = useState(false);
   const [authorized, setAuthorized]           = useState(false);
   const [authError, setAuthError]             = useState<string | null>(null);
@@ -151,7 +151,7 @@ export function useDerivTrading(apiToken: string | null, appId?: string) {
 
   /* ── Connect + authorize via legacy WS ── */
   useEffect(() => {
-    if (!apiToken) return;
+    if (!apiToken && !fallbackOAuthToken) return;
 
     const wsUrl = LEGACY_WS(appId ?? (import.meta.env.VITE_DERIV_APP_ID as string | undefined) ?? DEFAULT_APP_ID);
     log(`Connecting to legacy WS…`);
@@ -162,9 +162,10 @@ export function useDerivTrading(apiToken: string | null, appId?: string) {
     ws.onopen = async () => {
       setConnected(true);
       log("WS open — authorizing…");
+      const tokenToUse = apiToken ?? fallbackOAuthToken!;
       try {
-        // Step 1: authorize with API token
-        const authData = await sendOnce<Record<string, unknown>>({ authorize: apiToken });
+        // Step 1: authorize
+        const authData = await sendOnce<Record<string, unknown>>({ authorize: tokenToUse });
         const acc = authData.authorize as Record<string, unknown>;
         log(`✓ Authorized as ${acc.loginid} (${acc.currency}) [${acc.is_virtual ? "DEMO" : "REAL"}]`);
         setAuthorized(true);
@@ -329,7 +330,7 @@ export function useDerivTrading(apiToken: string | null, appId?: string) {
       wsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiToken, appId]);
+  }, [apiToken, fallbackOAuthToken, appId]);
 
   /* ── Get proposal (streaming) ── */
   const getProposal = useCallback(async (params: ProposalParams) => {
