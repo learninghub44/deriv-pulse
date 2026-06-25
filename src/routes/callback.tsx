@@ -2,7 +2,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useDerivOAuth } from "@/hooks/use-deriv-oauth";
 
-export const Route = createFileRoute("/callback" as "/")({
+export const Route = createFileRoute("/callback")({
   component: CallbackPage,
 });
 
