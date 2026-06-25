@@ -24,9 +24,9 @@ export interface DerivAuthState {
   error: string | null;
 }
 
-const CLIENT_ID  = import.meta.env.VITE_DERIV_CLIENT_ID as string | undefined;
-const APP_ID     = import.meta.env.VITE_DERIV_APP_ID    as string | undefined;
-const REDIRECT   = typeof window !== "undefined"
+const CLIENT_ID = import.meta.env.VITE_DERIV_CLIENT_ID as string | undefined;
+const APP_ID    = import.meta.env.VITE_DERIV_APP_ID    as string | undefined;
+const REDIRECT  = typeof window !== "undefined"
   ? `${window.location.origin}/callback`
   : "http://localhost:3000/callback";
 
@@ -52,81 +52,101 @@ export function useDerivOAuth() {
     error: null,
   });
 
-  const otpCacheRef = useRef<Map<string, string>>(new Map()); // accountId → ws url
+  const otpCacheRef = useRef<Map<string, string>>(new Map());
+  const initRef     = useRef(false);
 
-  /* ── Restore from session on mount ── */
+  /* ── Internal: fetch OTP WS URL for an account ── */
+  const fetchWsUrl = useCallback(async (accountId: string, accessToken: string): Promise<string> => {
+    let wsUrl = otpCacheRef.current.get(accountId);
+    if (!wsUrl) {
+      wsUrl = await getAuthenticatedWsUrl(accountId, accessToken, APP_ID);
+      otpCacheRef.current.set(accountId, wsUrl);
+    }
+    return wsUrl;
+  }, []);
+
+  /* ── Auto-initialize: restore session + auto-fetch WS URL ── */
   useEffect(() => {
+    if (initRef.current) return;
+    initRef.current = true;
+
     const saved = restore();
     if (!saved) return;
 
-    setState((prev) => ({
-      ...prev,
-      accessToken: saved.token,
-      accounts: saved.accounts,
-      activeAccount: saved.accounts.find((a) => a.account_id === saved.activeAccountId) ?? saved.accounts[0] ?? null,
-    }));
-  }, []);
+    const { token, accounts, activeAccountId } = saved;
+    const active = accounts.find(a => a.account_id === activeAccountId) ?? accounts[0] ?? null;
+
+    // Restore state immediately (no WS URL yet)
+    setState(prev => ({ ...prev, accessToken: token, accounts, activeAccount: active, loading: true }));
+
+    // Auto-fetch WS URL for the active account
+    if (active) {
+      fetchWsUrl(active.account_id, token)
+        .then(wsUrl => {
+          setState(prev => ({ ...prev, authenticatedWsUrl: wsUrl, loading: false }));
+        })
+        .catch(e => {
+          // OTP failed — still set state, just without wsUrl
+          setState(prev => ({ ...prev, loading: false, error: `Auto-connect failed: ${e}` }));
+        });
+    } else {
+      setState(prev => ({ ...prev, loading: false }));
+    }
+  }, [fetchWsUrl]);
 
   /* ── Start OAuth login ── */
   const login = useCallback(async (signup = false) => {
     if (!CLIENT_ID) {
-      setState((prev) => ({ ...prev, error: "Set VITE_DERIV_CLIENT_ID in .env to enable Deriv login" }));
+      setState(prev => ({ ...prev, error: "Set VITE_DERIV_CLIENT_ID in .env to enable Deriv login" }));
       return;
     }
-    setState((prev) => ({ ...prev, loading: true, error: null }));
+    setState(prev => ({ ...prev, loading: true, error: null }));
     try {
       const { codeVerifier, codeChallenge, state: oauthState } = await generatePKCE();
       sessionStorage.setItem("pkce_cv", codeVerifier);
       sessionStorage.setItem("oauth_state", oauthState);
-
-      const url = buildDerivAuthURL({
-        clientId: CLIENT_ID,
-        redirectUri: REDIRECT,
-        codeChallenge,
-        state: oauthState,
-        signup,
-      });
+      const url = buildDerivAuthURL({ clientId: CLIENT_ID, redirectUri: REDIRECT, codeChallenge, state: oauthState, signup });
       window.location.href = url;
     } catch (e) {
-      setState((prev) => ({ ...prev, loading: false, error: String(e) }));
+      setState(prev => ({ ...prev, loading: false, error: String(e) }));
     }
   }, []);
 
-  /* ── Handle OAuth callback (call from /callback route or on mount) ── */
+  /* ── Handle OAuth callback ── */
   const handleCallback = useCallback(async (code: string, returnedState: string) => {
     if (!CLIENT_ID) return;
-    const storedState    = sessionStorage.getItem("oauth_state");
-    const codeVerifier   = sessionStorage.getItem("pkce_cv");
+    const storedState  = sessionStorage.getItem("oauth_state");
+    const codeVerifier = sessionStorage.getItem("pkce_cv");
 
     if (returnedState !== storedState) {
-      setState((prev) => ({ ...prev, error: "OAuth state mismatch — possible CSRF" }));
+      setState(prev => ({ ...prev, error: "OAuth state mismatch — possible CSRF" }));
       return;
     }
     if (!codeVerifier) {
-      setState((prev) => ({ ...prev, error: "PKCE code verifier missing" }));
+      setState(prev => ({ ...prev, error: "PKCE code verifier missing" }));
       return;
     }
 
-    setState((prev) => ({ ...prev, loading: true, error: null }));
+    setState(prev => ({ ...prev, loading: true, error: null }));
     try {
-      const { access_token } = await exchangeCodeForToken({
-        clientId: CLIENT_ID,
-        code,
-        codeVerifier,
-        redirectUri: REDIRECT,
-      });
-
+      const { access_token } = await exchangeCodeForToken({ clientId: CLIENT_ID, code, codeVerifier, redirectUri: REDIRECT });
       const accounts = (await fetchDerivAccounts(access_token, APP_ID)) as DerivAccount[];
-      // Prefer demo account by default for safety
-      const active = accounts.find((a) => a.account_type === "demo") ?? accounts[0] ?? null;
+      // Prefer demo account for safety
+      const active = accounts.find(a => a.account_type === "demo") ?? accounts[0] ?? null;
 
       persist({ token: access_token, accounts, activeAccountId: active?.account_id ?? "" });
+
+      // Immediately fetch WS URL for active account
+      let wsUrl: string | null = null;
+      if (active) {
+        try { wsUrl = await fetchWsUrl(active.account_id, access_token); } catch { /* set below */ }
+      }
 
       setState({
         accessToken: access_token,
         accounts,
         activeAccount: active,
-        authenticatedWsUrl: null,
+        authenticatedWsUrl: wsUrl,
         loading: false,
         error: null,
       });
@@ -134,51 +154,38 @@ export function useDerivOAuth() {
       sessionStorage.removeItem("pkce_cv");
       sessionStorage.removeItem("oauth_state");
     } catch (e) {
-      setState((prev) => ({ ...prev, loading: false, error: String(e) }));
+      setState(prev => ({ ...prev, loading: false, error: String(e) }));
     }
-  }, []);
+  }, [fetchWsUrl]);
 
-  /* ── Switch active account & get fresh OTP WS URL ── */
+  /* ── Switch account ── */
   const switchAccount = useCallback(async (accountId: string) => {
     const { accessToken, accounts } = state;
     if (!accessToken) return;
-
-    const account = accounts.find((a) => a.account_id === accountId);
+    const account = accounts.find(a => a.account_id === accountId);
     if (!account) return;
 
-    setState((prev) => ({ ...prev, loading: true, error: null }));
+    setState(prev => ({ ...prev, loading: true, error: null, authenticatedWsUrl: null }));
     try {
-      // Check cache first (OTPs can be reused within a session for WS connections)
-      let wsUrl = otpCacheRef.current.get(accountId);
-      if (!wsUrl) {
-        wsUrl = await getAuthenticatedWsUrl(accountId, accessToken, APP_ID);
-        otpCacheRef.current.set(accountId, wsUrl);
-      }
-
+      const wsUrl = await fetchWsUrl(accountId, accessToken);
       const saved = restore();
       if (saved) persist({ ...saved, activeAccountId: accountId });
-
-      setState((prev) => ({
-        ...prev,
-        activeAccount: account,
-        authenticatedWsUrl: wsUrl!,
-        loading: false,
-      }));
+      setState(prev => ({ ...prev, activeAccount: account, authenticatedWsUrl: wsUrl, loading: false }));
     } catch (e) {
-      setState((prev) => ({ ...prev, loading: false, error: String(e) }));
+      setState(prev => ({ ...prev, loading: false, error: String(e) }));
     }
-  }, [state]);
+  }, [state, fetchWsUrl]);
 
-  /* ── Refresh balance for active account ── */
+  /* ── Refresh balances ── */
   const refreshBalance = useCallback(async () => {
-    const { accessToken, accounts, activeAccount } = state;
+    const { accessToken, activeAccount } = state;
     if (!accessToken) return;
     try {
       const fresh = (await fetchDerivAccounts(accessToken, APP_ID)) as DerivAccount[];
-      setState((prev) => ({
+      setState(prev => ({
         ...prev,
         accounts: fresh,
-        activeAccount: fresh.find((a) => a.account_id === activeAccount?.account_id) ?? prev.activeAccount,
+        activeAccount: fresh.find(a => a.account_id === activeAccount?.account_id) ?? prev.activeAccount,
       }));
       const saved = restore();
       if (saved) persist({ ...saved, accounts: fresh });
@@ -189,23 +196,13 @@ export function useDerivOAuth() {
   const logout = useCallback(() => {
     sessionStorage.removeItem(STORAGE_KEY);
     otpCacheRef.current.clear();
-    setState({
-      accessToken: null,
-      accounts: [],
-      activeAccount: null,
-      authenticatedWsUrl: null,
-      loading: false,
-      error: null,
-    });
+    setState({ accessToken: null, accounts: [], activeAccount: null, authenticatedWsUrl: null, loading: false, error: null });
   }, []);
-
-  const isAuthenticated = !!state.accessToken;
-  const hasClientId     = !!CLIENT_ID;
 
   return {
     ...state,
-    isAuthenticated,
-    hasClientId,
+    isAuthenticated: !!state.accessToken,
+    hasClientId: !!CLIENT_ID,
     login,
     logout,
     handleCallback,

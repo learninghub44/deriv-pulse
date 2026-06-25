@@ -99,11 +99,12 @@ export function useDerivTrading(wsUrl: string | null, accessToken?: string | nul
   const reqId       = useRef(100);
   const propSubRef  = useRef<string | null>(null);
   const listeners   = useRef<Map<number, (data: Record<string, unknown>) => void>>(new Map());
-  const streamers   = useRef<Map<number, (data: Record<string, unknown>) => void>>(new Map()); // persistent sub handlers
+  const streamers   = useRef<Map<number, (data: Record<string, unknown>) => void>>(new Map());
+  const propResolverRef = useRef<((data: Record<string, unknown>) => void) | null>(null); // for auto-trade
   const pingRef     = useRef<ReturnType<typeof setInterval> | null>(null);
-  const autoRef     = useRef(false);         // live flag for auto loop
-  const autoAmount  = useRef(0);             // current amount (for martingale)
-  const autoStakes  = useRef<number[]>([]);  // stake history for martingale
+  const autoRef     = useRef(false);
+  const autoAmount  = useRef(0);
+  const autoStakes  = useRef<number[]>([]);
 
   const nextId = () => ++reqId.current;
 
@@ -238,16 +239,16 @@ export function useDerivTrading(wsUrl: string | null, accessToken?: string | nul
           return;
         }
 
-        // ── Proposal stream (subscription, no matching listener after first) ──
+        // ── Proposal stream ──
         if (type === "proposal") {
           const p = data.proposal as Record<string, unknown> | undefined;
           if (!p) return;
           const sub = data.subscription as Record<string, unknown> | undefined;
           if (sub?.id) propSubRef.current = sub.id as string;
 
-          const ask   = Number(p.ask_price);
+          const ask    = Number(p.ask_price);
           const payout = Number(p.payout);
-          setProposal({
+          const prop: Proposal = {
             id: String(p.id),
             ask_price: ask,
             payout,
@@ -256,8 +257,14 @@ export function useDerivTrading(wsUrl: string | null, accessToken?: string | nul
             longcode: String(p.longcode),
             contract_type: String(p.contract_type ?? ""),
             return_pct: ask > 0 ? ((payout - ask) / ask) * 100 : 0,
-          });
+          };
+          setProposal(prop);
           setProposalLoading(false);
+
+          // Notify auto-trade loop if it's waiting for a proposal
+          if (propResolverRef.current) {
+            propResolverRef.current(data);
+          }
           return;
         }
 
@@ -505,11 +512,12 @@ export function useDerivTrading(wsUrl: string | null, accessToken?: string | nul
           try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
           propSubRef.current = null;
         }
+        setProposal(null);
         setProposalLoading(true);
 
-        const rid = nextId();
         const propPayload: Record<string, unknown> = {
-          proposal: 1, req_id: rid,
+          proposal: 1,
+          req_id: nextId(),
           amount: stake,
           basis: config.basis,
           contract_type: config.contract_type,
@@ -521,15 +529,17 @@ export function useDerivTrading(wsUrl: string | null, accessToken?: string | nul
         };
         if (config.barrier) propPayload.barrier = config.barrier;
 
-        // Wait for first proposal response
+        // Wait for first proposal response via the onmessage proposal handler
+        // We resolve when proposal state updates (the onmessage handler sets it)
         const propData = await new Promise<Record<string, unknown>>((resolve, reject) => {
-          const timer = setTimeout(() => { listeners.current.delete(rid); reject(new Error("Proposal timeout")); }, 10_000);
-          listeners.current.set(rid, (data) => {
+          const timer = setTimeout(() => reject(new Error("Proposal timeout after 10s")), 10_000);
+          // One-shot resolver that fires when the proposal stream first responds
+          propResolverRef.current = (data) => {
             clearTimeout(timer);
-            if (data.error) reject(new Error((data.error as Record<string, unknown>).message as string));
-            else resolve(data);
-          });
-          rawSend(propPayload);
+            propResolverRef.current = null;
+            resolve(data);
+          };
+          try { rawSend(propPayload); } catch (e) { clearTimeout(timer); propResolverRef.current = null; reject(e); }
         });
 
         const p = propData.proposal as Record<string, unknown>;

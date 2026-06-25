@@ -141,7 +141,14 @@ function Index() {
   const { user, profile, loading: authLoading, signOut } = useAuth();
   const { watchlists, defaultList, addSymbol, removeSymbol } = useWatchlists(user?.id);
   const derivOAuth = useDerivOAuth();
-  const { ticks, status } = useDerivTicks(symbol, derivOAuth.authenticatedWsUrl ?? undefined);
+
+  // Auto-open trading panel when Deriv account connects
+  useEffect(() => {
+    if (derivOAuth.isAuthenticated && derivOAuth.authenticatedWsUrl) {
+      setShowTrading(true);
+    }
+  }, [derivOAuth.isAuthenticated, derivOAuth.authenticatedWsUrl]);
+  const { ticks, status } = useDerivTicks(symbol); // public WS — authenticated WS is for trading only
 
   const { alerts, dismiss, clearAll, testAlarm } = useAlerts(ticks, symbol, windowSize, alertConfig);
 

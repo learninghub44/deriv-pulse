@@ -64,6 +64,20 @@ export function TradingPanel({ wsUrl, accessToken, symbol, currentPrice, pipSize
   const authOk    = connected && authorized;
   const isDemo    = activeAccount?.account_type === "demo";
 
+  // Auto-sync symbol into auto-trade config when it changes
+  useEffect(() => {
+    // symbol is always passed from parent — nothing extra needed,
+    // we use it directly in handleGetProposal and handleStartAuto
+  }, [symbol]);
+
+  // Auto-fetch quote when switching to trade tab (if authorized)
+  useEffect(() => {
+    if (tab === "trade" && authOk && !proposal && !proposalLoading) {
+      handleGetProposal();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, authOk]);
+
   function handleGetProposal() {
     const params: ProposalParams = {
       contract_type: contractType,
@@ -77,6 +91,15 @@ export function TradingPanel({ wsUrl, accessToken, symbol, currentPrice, pipSize
     };
     getProposal(params);
   }
+
+  // Refresh quote when contract type, amount, duration or symbol changes
+  useEffect(() => {
+    if (authOk && tab === "trade") {
+      const t = setTimeout(() => handleGetProposal(), 300);
+      return () => clearTimeout(t);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contractType, amount, duration, durUnit, symbol, authOk]);
 
   function handleStartAuto() {
     const config: AutoTradeConfig = {
