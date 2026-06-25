@@ -1,11 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /* ─── Types ──────────────────────────────────────────────────────────────── */
-export interface Balance {
-  balance: number;
-  currency: string;
-  loginid: string;
-}
+export interface Balance { balance: number; currency: string; loginid: string }
 
 export interface Proposal {
   id: string;
@@ -13,10 +9,9 @@ export interface Proposal {
   payout: number;
   spot: number;
   spot_time: number;
-  date_start: number;
-  date_expiry?: number;
   longcode: string;
   contract_type: string;
+  return_pct: number;  // profit % if win
 }
 
 export interface OpenContract {
@@ -35,11 +30,7 @@ export interface OpenContract {
   date_expiry: number;
   entry_spot: number;
   current_spot: number;
-  current_spot_time: number;
-  exit_tick?: number;
-  exit_tick_time?: number;
   sell_price?: number;
-  sell_time?: number;
 }
 
 export interface BuyResult {
@@ -52,9 +43,15 @@ export interface BuyResult {
   start_time: number;
 }
 
+export interface TradeResult extends BuyResult {
+  outcome?: "won" | "lost";
+  sell_price?: number;
+  profit?: number;
+}
+
 export interface ProposalParams {
   contract_type: string;
-  underlying_symbol: string;
+  symbol: string;        // Deriv still uses "symbol" not "underlying_symbol" in proposal API
   currency: string;
   amount: number;
   basis: "stake" | "payout";
@@ -63,101 +60,177 @@ export interface ProposalParams {
   barrier?: string;
 }
 
+export interface AutoTradeConfig {
+  enabled: boolean;
+  contract_type: string;
+  symbol: string;
+  currency: string;
+  amount: number;
+  basis: "stake" | "payout";
+  duration: number;
+  duration_unit: "t" | "s" | "m" | "h" | "d";
+  barrier?: string;
+  max_trades?: number;         // stop after N trades (0 = unlimited)
+  stop_loss?: number;          // stop if balance drops below this
+  take_profit?: number;        // stop if balance rises above this
+  delay_between_ms?: number;   // ms between trades (default 500)
+  martingale?: boolean;        // double stake on loss
+  martingale_multiplier?: number;
+}
+
 /* ─── Hook ───────────────────────────────────────────────────────────────── */
-export function useDerivTrading(wsUrl: string | null) {
-  const [connected, setConnected]     = useState(false);
-  const [balance, setBalance]         = useState<Balance | null>(null);
-  const [proposal, setProposal]       = useState<Proposal | null>(null);
+export function useDerivTrading(wsUrl: string | null, accessToken?: string | null) {
+  const [connected, setConnected]           = useState(false);
+  const [authorized, setAuthorized]         = useState(false);
+  const [balance, setBalance]               = useState<Balance | null>(null);
+  const [proposal, setProposal]             = useState<Proposal | null>(null);
   const [proposalLoading, setProposalLoading] = useState(false);
-  const [openContracts, setOpenContracts]     = useState<OpenContract[]>([]);
-  const [buyResult, setBuyResult]     = useState<BuyResult | null>(null);
-  const [buying, setBuying]           = useState(false);
-  const [error, setError]             = useState<string | null>(null);
-  const [lastTrade, setLastTrade]     = useState<BuyResult | null>(null);
+  const [openContracts, setOpenContracts]   = useState<OpenContract[]>([]);
+  const [buying, setBuying]                 = useState(false);
+  const [error, setError]                   = useState<string | null>(null);
+  const [lastTrade, setLastTrade]           = useState<TradeResult | null>(null);
+  const [tradeHistory, setTradeHistory]     = useState<TradeResult[]>([]);
+  const [autoConfig, setAutoConfig]         = useState<AutoTradeConfig | null>(null);
+  const [autoRunning, setAutoRunning]       = useState(false);
+  const [autoStats, setAutoStats]           = useState({ trades: 0, won: 0, lost: 0, pnl: 0 });
+  const [wsLog, setWsLog]                   = useState<string[]>([]);  // debug log
 
-  const wsRef        = useRef<WebSocket | null>(null);
-  const reqId        = useRef(100);
-  const propSubRef   = useRef<string | null>(null);
-  const balSubRef    = useRef<string | null>(null);
-  const listeners    = useRef<Map<number, (data: Record<string, unknown>) => void>>(new Map());
-  const pingRef      = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsRef       = useRef<WebSocket | null>(null);
+  const reqId       = useRef(100);
+  const propSubRef  = useRef<string | null>(null);
+  const listeners   = useRef<Map<number, (data: Record<string, unknown>) => void>>(new Map());
+  const streamers   = useRef<Map<number, (data: Record<string, unknown>) => void>>(new Map()); // persistent sub handlers
+  const pingRef     = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoRef     = useRef(false);         // live flag for auto loop
+  const autoAmount  = useRef(0);             // current amount (for martingale)
+  const autoStakes  = useRef<number[]>([]);  // stake history for martingale
 
-  const nextReqId = () => ++reqId.current;
+  const nextId = () => ++reqId.current;
 
-  /* ── Send helper with promise ── */
-  const send = useCallback(<T>(payload: Record<string, unknown>, timeout = 10_000): Promise<T> => {
+  const log = (msg: string) => setWsLog(prev => [`${new Date().toLocaleTimeString()} ${msg}`, ...prev].slice(0, 50));
+
+  /* ── Raw send ── */
+  function rawSend(payload: Record<string, unknown>) {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("WebSocket not open");
+    const msg = JSON.stringify(payload);
+    ws.send(msg);
+  }
+
+  /* ── Promise send (one-shot response) ── */
+  const send = useCallback(<T>(payload: Record<string, unknown>, timeout = 15_000): Promise<T> => {
     return new Promise((resolve, reject) => {
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        reject(new Error("Not connected"));
-        return;
-      }
-      const rid = (payload.req_id as number) ?? nextReqId();
+      const rid = payload.req_id as number ?? nextId();
       const full = { ...payload, req_id: rid };
 
       const timer = setTimeout(() => {
         listeners.current.delete(rid);
-        reject(new Error(`Request ${rid} timed out`));
+        reject(new Error(`Request timed out (req_id ${rid})`));
       }, timeout);
 
       listeners.current.set(rid, (data) => {
         clearTimeout(timer);
         if (data.error) {
-          reject(new Error((data.error as Record<string, unknown>).message as string));
+          const msg = (data.error as Record<string, unknown>).message as string ?? JSON.stringify(data.error);
+          reject(new Error(msg));
         } else {
           resolve(data as T);
         }
       });
 
-      ws.send(JSON.stringify(full));
+      try {
+        rawSend(full);
+      } catch (e) {
+        clearTimeout(timer);
+        listeners.current.delete(rid);
+        reject(e);
+      }
     });
   }, []);
 
-  /* ── Connect to authenticated WS ── */
+  /* ── Connect + authorize ── */
   useEffect(() => {
     if (!wsUrl) return;
 
+    log("Connecting…");
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
-    ws.onopen = () => {
+    ws.onopen = async () => {
       setConnected(true);
-      setError(null);
+      log("Connected");
 
-      // Subscribe to balance
-      const balReqId = nextReqId();
-      listeners.current.set(balReqId, (data) => {
-        const b = (data.balance ?? data) as Record<string, unknown>;
-        if (b.balance !== undefined) {
-          setBalance({
-            balance: Number(b.balance),
-            currency: String(b.currency),
-            loginid: String(b.loginid ?? ""),
-          });
-          if ((data.subscription as Record<string, unknown>)?.id) {
-            balSubRef.current = (data.subscription as Record<string, unknown>).id as string;
+      // Step 1: authorize with access token if provided (legacy WS still needs this)
+      if (accessToken) {
+        try {
+          log("Authorizing…");
+          const authData = await send<Record<string, unknown>>({ authorize: accessToken, req_id: nextId() });
+          const acct = (authData.authorize ?? authData) as Record<string, unknown>;
+          log(`Authorized as ${acct.loginid ?? "unknown"}`);
+          setAuthorized(true);
+          // Set balance from authorize response
+          if (acct.balance !== undefined) {
+            setBalance({
+              balance: Number(acct.balance),
+              currency: String(acct.currency ?? "USD"),
+              loginid: String(acct.loginid ?? ""),
+            });
           }
+        } catch (e) {
+          log(`Auth failed: ${e}`);
+          setError(`Authorization failed: ${e}`);
+          return;
+        }
+      } else {
+        // OTP URL — already authenticated
+        setAuthorized(true);
+        log("Using OTP auth — no authorize msg needed");
+      }
+
+      // Step 2: subscribe to balance stream
+      const balRid = nextId();
+      streamers.current.set(balRid, (data) => {
+        const b = data.balance as Record<string, unknown> | undefined;
+        if (b) setBalance({ balance: Number(b.balance), currency: String(b.currency), loginid: String(b.loginid ?? "") });
+      });
+      rawSend({ balance: 1, subscribe: 1, req_id: balRid });
+      log("Subscribed to balance");
+
+      // Step 3: load open portfolio
+      const portRid = nextId();
+      listeners.current.set(portRid, (data) => {
+        const contracts = (data.portfolio as Record<string, unknown>)?.contracts as Record<string, unknown>[] | undefined;
+        if (contracts?.length) {
+          log(`Found ${contracts.length} open contract(s), subscribing…`);
+          contracts.forEach((c) => {
+            rawSend({ proposal_open_contract: 1, contract_id: Number(c.contract_id), subscribe: 1 });
+          });
         }
       });
-      ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: balReqId }));
+      rawSend({ portfolio: 1, req_id: portRid });
 
-      // Subscribe to open contracts via portfolio
-      const portReqId = nextReqId();
-      ws.send(JSON.stringify({ portfolio: 1, req_id: portReqId }));
-
-      // Keepalive
+      // Keepalive ping
       if (pingRef.current) clearInterval(pingRef.current);
       pingRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ping: 1 }));
+        if (ws.readyState === WebSocket.OPEN) rawSend({ ping: 1 });
       }, 25_000);
     };
 
     ws.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data as string) as Record<string, unknown>;
+        const type = data.msg_type as string;
+        const rid  = data.req_id as number | undefined;
 
-        // Route to specific listener if req_id matches
-        const rid = data.req_id as number | undefined;
+        if (type === "ping") return;
+
+        // Persistent stream handler (balance sub etc.)
+        if (rid && streamers.current.has(rid)) {
+          streamers.current.get(rid)!(data);
+          return; // don't delete — it's persistent
+        }
+
+        // One-shot response handler
         if (rid && listeners.current.has(rid)) {
           const cb = listeners.current.get(rid)!;
           listeners.current.delete(rid);
@@ -165,165 +238,170 @@ export function useDerivTrading(wsUrl: string | null) {
           return;
         }
 
-        // Subscription stream messages (no req_id match)
-        const type = data.msg_type as string;
-
-        if (type === "balance") {
-          const b = data.balance as Record<string, unknown>;
-          setBalance({ balance: Number(b.balance), currency: String(b.currency), loginid: String(b.loginid ?? "") });
-        }
-
+        // ── Proposal stream (subscription, no matching listener after first) ──
         if (type === "proposal") {
-          const p = data.proposal as Record<string, unknown>;
-          if (p) {
-            const sub = data.subscription as Record<string, unknown> | undefined;
-            if (sub?.id) propSubRef.current = sub.id as string;
-            setProposal({
-              id: String(p.id),
-              ask_price: Number(p.ask_price),
-              payout: Number(p.payout),
-              spot: Number(p.spot),
-              spot_time: Number(p.spot_time),
-              date_start: Number(p.date_start),
-              date_expiry: p.date_expiry ? Number(p.date_expiry) : undefined,
-              longcode: String(p.longcode),
-              contract_type: String(p.contract_type ?? ""),
-            });
-            setProposalLoading(false);
-          }
+          const p = data.proposal as Record<string, unknown> | undefined;
+          if (!p) return;
+          const sub = data.subscription as Record<string, unknown> | undefined;
+          if (sub?.id) propSubRef.current = sub.id as string;
+
+          const ask   = Number(p.ask_price);
+          const payout = Number(p.payout);
+          setProposal({
+            id: String(p.id),
+            ask_price: ask,
+            payout,
+            spot: Number(p.spot ?? 0),
+            spot_time: Number(p.spot_time ?? 0),
+            longcode: String(p.longcode),
+            contract_type: String(p.contract_type ?? ""),
+            return_pct: ask > 0 ? ((payout - ask) / ask) * 100 : 0,
+          });
+          setProposalLoading(false);
+          return;
         }
 
+        // ── Open contract updates ──
         if (type === "proposal_open_contract") {
-          const poc = data.proposal_open_contract as Record<string, unknown>;
-          if (poc) {
-            const contract: OpenContract = {
-              contract_id: Number(poc.contract_id),
-              contract_type: String(poc.contract_type),
-              buy_price: Number(poc.buy_price),
-              bid_price: Number(poc.bid_price ?? poc.buy_price),
-              payout: Number(poc.payout),
-              profit: Number(poc.profit ?? 0),
-              profit_percentage: Number(poc.profit_percentage ?? 0),
-              status: String(poc.status),
-              is_sold: Number(poc.is_sold ?? 0),
-              underlying: String(poc.underlying),
-              longcode: String(poc.longcode),
-              date_start: Number(poc.date_start),
-              date_expiry: Number(poc.date_expiry),
-              entry_spot: Number(poc.entry_spot ?? poc.spot),
-              current_spot: Number(poc.current_spot ?? poc.spot),
-              current_spot_time: Number(poc.current_spot_time ?? poc.spot_time),
-              exit_tick: poc.exit_tick ? Number(poc.exit_tick) : undefined,
-              sell_price: poc.sell_price ? Number(poc.sell_price) : undefined,
-            };
-            setOpenContracts((prev) => {
-              const idx = prev.findIndex((c) => c.contract_id === contract.contract_id);
-              if (contract.is_sold) {
-                // Remove sold contracts after brief display
-                return idx >= 0 ? prev.filter((c) => c.contract_id !== contract.contract_id) : prev;
-              }
+          const poc = data.proposal_open_contract as Record<string, unknown> | undefined;
+          if (!poc) return;
+          const contract: OpenContract = {
+            contract_id: Number(poc.contract_id),
+            contract_type: String(poc.contract_type),
+            buy_price: Number(poc.buy_price),
+            bid_price: Number(poc.bid_price ?? poc.buy_price),
+            payout: Number(poc.payout),
+            profit: Number(poc.profit ?? 0),
+            profit_percentage: Number(poc.profit_percentage ?? 0),
+            status: String(poc.status),
+            is_sold: Number(poc.is_sold ?? 0),
+            underlying: String(poc.underlying),
+            longcode: String(poc.longcode),
+            date_start: Number(poc.date_start),
+            date_expiry: Number(poc.date_expiry),
+            entry_spot: Number(poc.entry_spot ?? poc.spot ?? 0),
+            current_spot: Number(poc.current_spot ?? poc.spot ?? 0),
+            sell_price: poc.sell_price ? Number(poc.sell_price) : undefined,
+          };
+
+          if (contract.is_sold) {
+            // Contract settled — update trade history with outcome
+            setOpenContracts(prev => prev.filter(c => c.contract_id !== contract.contract_id));
+            setTradeHistory(prev => {
+              const idx = prev.findIndex(t => t.contract_id === contract.contract_id);
+              const outcome: "won" | "lost" = contract.profit > 0 ? "won" : "lost";
               if (idx >= 0) {
-                const next = [...prev];
-                next[idx] = contract;
-                return next;
+                const updated = [...prev];
+                updated[idx] = { ...updated[idx], outcome, sell_price: contract.sell_price, profit: contract.profit };
+                return updated;
               }
+              return prev;
+            });
+            // Martingale: update stake for next trade
+            if (autoRef.current && autoConfig?.martingale) {
+              const won = contract.profit > 0;
+              if (won) {
+                autoAmount.current = autoConfig.amount; // reset on win
+              } else {
+                autoAmount.current = autoAmount.current * (autoConfig.martingale_multiplier ?? 2);
+              }
+            }
+          } else {
+            setOpenContracts(prev => {
+              const idx = prev.findIndex(c => c.contract_id === contract.contract_id);
+              if (idx >= 0) { const n = [...prev]; n[idx] = contract; return n; }
               return [...prev, contract];
             });
           }
+          return;
         }
 
-        if (type === "portfolio") {
-          const contracts = (data.portfolio as Record<string, unknown>)?.contracts as Record<string, unknown>[] | undefined;
-          // Subscribe to each open contract for live updates
-          if (contracts?.length) {
-            contracts.forEach((c) => {
-              const cid = Number(c.contract_id);
-              const subReqId = nextReqId();
-              ws.send(JSON.stringify({
-                proposal_open_contract: 1,
-                contract_id: cid,
-                subscribe: 1,
-                req_id: subReqId,
-              }));
-            });
-          }
-        }
-
+        // ── Balance update from transaction ──
         if (type === "transaction") {
-          // Refresh balance on any transaction
-          const bReqId = nextReqId();
-          ws.send(JSON.stringify({ balance: 1, req_id: bReqId }));
+          rawSend({ balance: 1, req_id: nextId() });
+          return;
         }
 
-        if (type === "ping") return;
+        if (type === "balance") {
+          const b = data.balance as Record<string, unknown> | undefined;
+          if (b) setBalance({ balance: Number(b.balance), currency: String(b.currency), loginid: String(b.loginid ?? "") });
+          return;
+        }
 
       } catch (e) {
-        console.error("[TradingWS] parse error:", e);
+        console.error("[TradingWS]", e);
       }
     };
 
-    ws.onerror = () => setError("WebSocket connection error");
-    ws.onclose = () => {
+    ws.onerror = (e) => {
+      log(`WS error: ${e}`);
+      setError("WebSocket error — check console");
+    };
+    ws.onclose = (e) => {
       if (pingRef.current) clearInterval(pingRef.current);
       setConnected(false);
+      setAuthorized(false);
+      log(`Disconnected (${e.code})`);
     };
 
     return () => {
+      autoRef.current = false;
       if (pingRef.current) clearInterval(pingRef.current);
       ws.close();
     };
-  }, [wsUrl]);
+  }, [wsUrl, accessToken, send]);
 
-  /* ── Get proposal ── */
+  /* ── Get proposal (streaming) ── */
   const getProposal = useCallback(async (params: ProposalParams) => {
-    // Forget old proposal subscription
-    if (propSubRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ forget: propSubRef.current }));
+    if (!authorized) { setError("Not authorized — connect Deriv account first"); return; }
+    // Forget old proposal sub
+    if (propSubRef.current) {
+      try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
       propSubRef.current = null;
     }
     setProposal(null);
     setError(null);
     setProposalLoading(true);
 
-    const rid = nextReqId();
     const payload: Record<string, unknown> = {
       proposal: 1,
-      req_id: rid,
+      req_id: nextId(),
       amount: params.amount,
       basis: params.basis,
       contract_type: params.contract_type,
       currency: params.currency,
       duration: params.duration,
       duration_unit: params.duration_unit,
-      underlying_symbol: params.underlying_symbol,
+      symbol: params.symbol,   // ← correct field name for Deriv proposal API
       subscribe: 1,
     };
-    if (params.barrier) payload.barrier = params.barrier;
+    if (params.barrier !== undefined && params.barrier !== "") payload.barrier = params.barrier;
 
     try {
-      // Set up streaming listener (proposal streams so we use onmessage)
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("Not connected");
-      ws.send(JSON.stringify(payload));
-      // Proposal will arrive via onmessage → proposal handler above
+      rawSend(payload);
+      log(`Proposal requested: ${params.contract_type} ${params.symbol} ${params.amount} ${params.currency}`);
     } catch (e) {
       setError(String(e));
       setProposalLoading(false);
     }
-  }, []);
+  }, [authorized]);
 
-  /* ── Buy contract ── */
-  const buyContract = useCallback(async (proposalId: string, price: number) => {
-    if (!proposalId) { setError("No proposal to buy"); return; }
+  /* ── Execute single buy ── */
+  const buyContract = useCallback(async (proposalId: string, price: number): Promise<TradeResult | null> => {
+    if (!authorized) { setError("Not authorized"); return null; }
+    if (!proposalId) { setError("No proposal ID"); return null; }
+
     setBuying(true);
     setError(null);
-    setBuyResult(null);
+    log(`Buying proposal ${proposalId} @ ${price}…`);
 
     try {
-      const rid = nextReqId();
-      const data = await send<Record<string, unknown>>({ buy: proposalId, price, req_id: rid, subscribe: 1 }, 15_000);
+      const rid = nextId();
+      // NOTE: buy does NOT use subscribe:1
+      const data = await send<Record<string, unknown>>({ buy: proposalId, price, req_id: rid }, 20_000);
       const b = data.buy as Record<string, unknown>;
-      const result: BuyResult = {
+
+      const result: TradeResult = {
         contract_id: Number(b.contract_id),
         buy_price: Number(b.buy_price),
         payout: Number(b.payout),
@@ -332,67 +410,215 @@ export function useDerivTrading(wsUrl: string | null) {
         transaction_id: Number(b.transaction_id),
         start_time: Number(b.start_time),
       };
-      setBuyResult(result);
+
+      log(`✓ Bought! Contract #${result.contract_id} · Paid ${result.buy_price} · Max payout ${result.payout}`);
       setLastTrade(result);
-
-      // Subscribe to contract updates
-      const ws = wsRef.current;
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          proposal_open_contract: 1,
-          contract_id: result.contract_id,
-          subscribe: 1,
-        }));
-      }
-
-      // Update balance
-      if (balance) {
-        setBalance((prev) => prev ? { ...prev, balance: result.balance_after } : prev);
-      }
-
-      // Clear proposal
+      setTradeHistory(prev => [result, ...prev].slice(0, 50));
+      setBalance(prev => prev ? { ...prev, balance: result.balance_after } : prev);
       setProposal(null);
+
+      // Subscribe to this contract's live updates
+      try { rawSend({ proposal_open_contract: 1, contract_id: result.contract_id, subscribe: 1 }); } catch { /* ok */ }
+
+      // Forget proposal stream (it's consumed)
+      if (propSubRef.current) {
+        try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
+        propSubRef.current = null;
+      }
+
+      return result;
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      log(`✗ Buy failed: ${msg}`);
+      setError(msg);
+      return null;
     } finally {
       setBuying(false);
     }
-  }, [send, balance]);
+  }, [authorized, send]);
 
-  /* ── Sell contract ── */
+  /* ── Sell open contract ── */
   const sellContract = useCallback(async (contractId: number) => {
+    if (!authorized) { setError("Not authorized"); return; }
     setError(null);
+    log(`Selling contract #${contractId}…`);
     try {
-      const rid = nextReqId();
-      await send<Record<string, unknown>>({ sell: contractId, price: 0, req_id: rid }, 15_000);
-      // Contract will be removed via proposal_open_contract is_sold stream
+      await send<Record<string, unknown>>({ sell: contractId, price: 0, req_id: nextId() }, 15_000);
+      log(`✓ Sell order sent for #${contractId}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      log(`✗ Sell failed: ${msg}`);
+      setError(msg);
     }
-  }, [send]);
+  }, [authorized, send]);
 
-  /* ── Cancel proposal subscription ── */
+  /* ── Clear proposal ── */
   const clearProposal = useCallback(() => {
-    if (propSubRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ forget: propSubRef.current }));
+    if (propSubRef.current) {
+      try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
       propSubRef.current = null;
     }
     setProposal(null);
+    setProposalLoading(false);
+  }, []);
+
+  /* ── Auto trade ── */
+  const startAutoTrade = useCallback(async (config: AutoTradeConfig) => {
+    if (!authorized) { setError("Not authorized — connect Deriv first"); return; }
+    if (autoRef.current) return;
+
+    autoRef.current = true;
+    autoAmount.current = config.amount;
+    autoStakes.current = [];
+    setAutoRunning(true);
+    setAutoConfig(config);
+    setAutoStats({ trades: 0, won: 0, lost: 0, pnl: 0 });
+    log(`▶ Auto-trade started: ${config.contract_type} ${config.symbol} stake=${config.amount} ${config.currency}`);
+
+    let trades = 0;
+    let won = 0;
+    let lost = 0;
+    let pnl = 0;
+
+    while (autoRef.current) {
+      // Check stop conditions
+      if (config.max_trades && trades >= config.max_trades) {
+        log(`Auto-trade: reached max trades (${config.max_trades})`);
+        break;
+      }
+      const currentBalance = balance?.balance ?? 0;
+      if (config.stop_loss && currentBalance <= config.stop_loss) {
+        log(`Auto-trade: stop loss hit (balance ${currentBalance} ≤ ${config.stop_loss})`);
+        break;
+      }
+      if (config.take_profit && currentBalance >= config.take_profit) {
+        log(`Auto-trade: take profit hit (balance ${currentBalance} ≥ ${config.take_profit})`);
+        break;
+      }
+
+      const stake = autoAmount.current;
+
+      // Get proposal
+      try {
+        // Forget old sub
+        if (propSubRef.current) {
+          try { rawSend({ forget: propSubRef.current }); } catch { /* ok */ }
+          propSubRef.current = null;
+        }
+        setProposalLoading(true);
+
+        const rid = nextId();
+        const propPayload: Record<string, unknown> = {
+          proposal: 1, req_id: rid,
+          amount: stake,
+          basis: config.basis,
+          contract_type: config.contract_type,
+          currency: config.currency,
+          duration: config.duration,
+          duration_unit: config.duration_unit,
+          symbol: config.symbol,
+          subscribe: 1,
+        };
+        if (config.barrier) propPayload.barrier = config.barrier;
+
+        // Wait for first proposal response
+        const propData = await new Promise<Record<string, unknown>>((resolve, reject) => {
+          const timer = setTimeout(() => { listeners.current.delete(rid); reject(new Error("Proposal timeout")); }, 10_000);
+          listeners.current.set(rid, (data) => {
+            clearTimeout(timer);
+            if (data.error) reject(new Error((data.error as Record<string, unknown>).message as string));
+            else resolve(data);
+          });
+          rawSend(propPayload);
+        });
+
+        const p = propData.proposal as Record<string, unknown>;
+        const sub = propData.subscription as Record<string, unknown> | undefined;
+        if (sub?.id) propSubRef.current = sub.id as string;
+
+        const proposalId = String(p.id);
+        const askPrice   = Number(p.ask_price);
+        const payout     = Number(p.payout);
+
+        setProposal({
+          id: proposalId, ask_price: askPrice, payout,
+          spot: Number(p.spot ?? 0), spot_time: Number(p.spot_time ?? 0),
+          longcode: String(p.longcode), contract_type: config.contract_type,
+          return_pct: askPrice > 0 ? ((payout - askPrice) / askPrice) * 100 : 0,
+        });
+        setProposalLoading(false);
+
+        if (!autoRef.current) break;
+
+        // Execute buy
+        const result = await buyContract(proposalId, askPrice);
+        if (!result) { log("Auto-trade: buy failed, stopping"); break; }
+
+        trades++;
+        autoStakes.current.push(stake);
+
+        // Wait for contract to settle
+        const settled = await new Promise<{ won: boolean; profit: number }>((resolve) => {
+          const contractId = result.contract_id;
+          const checkInterval = setInterval(() => {
+            if (!autoRef.current) { clearInterval(checkInterval); resolve({ won: false, profit: 0 }); return; }
+            const contract = openContracts.find(c => c.contract_id === contractId);
+            if (!contract) {
+              // Contract removed from open list = settled
+              clearInterval(checkInterval);
+              // Check trade history for outcome
+              setTradeHistory(prev => {
+                const t = prev.find(h => h.contract_id === contractId);
+                if (t?.outcome) {
+                  resolve({ won: t.outcome === "won", profit: t.profit ?? 0 });
+                } else {
+                  resolve({ won: false, profit: 0 });
+                }
+                return prev;
+              });
+            }
+          }, 500);
+          // Safety timeout based on duration
+          const safetyMs = (config.duration_unit === "t" ? config.duration * 2000 : config.duration * 1000) + 10_000;
+          setTimeout(() => { clearInterval(checkInterval); resolve({ won: false, profit: 0 }); }, safetyMs);
+        });
+
+        if (settled.won) { won++; pnl += Math.abs(settled.profit); }
+        else { lost++; pnl -= stake; }
+
+        setAutoStats({ trades, won, lost, pnl });
+        log(`Trade #${trades}: ${settled.won ? "✓ WON" : "✗ LOST"} · P/L ${pnl.toFixed(2)}`);
+
+        if (!autoRef.current) break;
+
+        // Delay before next trade
+        await new Promise(r => setTimeout(r, config.delay_between_ms ?? 500));
+
+      } catch (e) {
+        log(`Auto-trade error: ${e}`);
+        setError(String(e));
+        // Brief pause before retry
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+
+    autoRef.current = false;
+    setAutoRunning(false);
+    setAutoConfig(null);
+    log(`■ Auto-trade stopped. Total: ${trades} trades | Won: ${won} | Lost: ${lost} | P/L: ${pnl.toFixed(2)}`);
+  }, [authorized, balance, buyContract, openContracts]);
+
+  const stopAutoTrade = useCallback(() => {
+    autoRef.current = false;
+    setAutoRunning(false);
+    log("■ Auto-trade stopped by user");
   }, []);
 
   return {
-    connected,
-    balance,
-    proposal,
-    proposalLoading,
-    openContracts,
-    buyResult,
-    lastTrade,
-    buying,
-    error,
-    getProposal,
-    buyContract,
-    sellContract,
-    clearProposal,
+    connected, authorized, balance, proposal, proposalLoading,
+    openContracts, buying, error, lastTrade, tradeHistory,
+    autoRunning, autoConfig, autoStats, wsLog,
+    getProposal, buyContract, sellContract, clearProposal,
+    startAutoTrade, stopAutoTrade,
   };
 }
